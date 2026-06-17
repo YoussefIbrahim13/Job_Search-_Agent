@@ -6,8 +6,8 @@ from pydantic_settings import BaseSettings
 logger = logging.getLogger(__name__)
 
 class Settings(BaseSettings):
-    ollama_base_url: str = Field(default="http://localhost:11434")
-    ollama_model: str = Field(default="llama3.1:8b")
+    groq_api_key: str = Field(default="")
+    groq_model: str = Field(default="qwen/qwen3-32b")
     tavily_api_key: str = Field(default="")
     tavily_max_results: int = Field(default=5)
     max_agent_iterations: int = Field(default=2)

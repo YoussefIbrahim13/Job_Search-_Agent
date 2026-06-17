@@ -232,3 +232,5 @@ Four `BaseTool` subclasses registered with LangGraph:
 **Tavily quota:** The free tier gives 1,000 searches/month. Each agent run typically uses 3–6 searches.
 
 **Switching models:** Edit `GROQ_MODEL` in `.env`. `llama-3.1-70b-versatile` offers a larger context window (128K) which is useful for very detailed CVs.
+
+# Job_Search-_Agent

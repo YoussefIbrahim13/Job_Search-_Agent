@@ -1,18 +1,23 @@
+# ── API & Server ──
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 pydantic-settings
+python-dotenv
+
+# ── AI & LangGraph ──
 langchain
 langchain-core
-langchain-ollama
+langchain-groq
 langgraph
+
+# ── Tools & Search ──
 tavily-python
-pdfplumber
-pypdf
-python-docx
-beautifulsoup4
-requests
-lxml
-python-dotenv
-tenacity
 httpx
+requests
+tenacity
+
+# ── Document Parsing (CVs) ──
+PyMuPDF
+pdfminer.six
+python-docx
