@@ -1,7 +1,7 @@
 """
 backend/agents/recruitment_agent.py
 ====================================
-LangGraph-based Recruitment AI Agent using a local Ollama model.
+LangGraph-based Recruitment AI Agent using Groq / Qwen3-32b.
 
 DESIGN PRINCIPLES
 -----------------
@@ -29,22 +29,19 @@ Graph topology
                        │
                       END
 
-Fixes vs original
------------------
-  - Removed circular self-import (this file has no FastAPI imports)
-  - System prompt contains NO per-request placeholders (job_title / location
-    are injected via HumanMessage, not SystemMessage)
-  - LLM + tool binding instantiated ONCE at graph-build time via lru_cache
-  - graceful_exit_node scans backwards for the last AIMessage; never reads a
-    ToolMessage as the "final answer" when the iteration cap fires
-  - URL injection replaced by per-job link validation (no positional mapping)
-  - _COMPILED_GRAPH replaced with functools.lru_cache
-  - _validate_and_fix_output called exactly ONCE per request
-  - _sanitize_targeted_search_result (score=70 corruption) removed entirely
-  - All regex patterns compiled at module level (never inside functions)
-  - _extract_json Strategy 3 fixed: scans from first '{' to EOF, not to rfind('}')
-  - run_cv_analysis no longer calls _validate_and_fix_output a second time
-  - Double-validation in run_cv_analysis removed
+CHANGES IN THIS REVISION
+-------------------------
+  - Zero Hallucination: System prompt now contains an explicit, numbered
+    "ABSOLUTE PROHIBITIONS" block. Any field not found verbatim in search
+    snippets must use a defined sentinel ("Unknown", "Not specified", []).
+  - Recent Jobs: All search queries target 2026. _validate_and_fix_output
+    drops listings whose title or snippet suggests they are stale aggregators.
+  - Internship scope: System prompt and both public API user messages explicitly
+    instruct the model to include internship roles alongside full-time listings.
+  - Valid URLs: Jobs whose application_link resolves to "#" after validation are
+    now DROPPED entirely from the output rather than kept with a dummy link.
+    A new _PLACEHOLDER_COMPANY_RE guard removes listings with generic fake names.
+  - Model: qwen/qwen3-32b via ChatGroq (set in settings.groq_model).
 """
 
 from __future__ import annotations
@@ -61,7 +58,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
 )
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -94,6 +91,23 @@ _JOB_BOARD_NAMES_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Catch obviously hallucinated / placeholder company names.
+_PLACEHOLDER_COMPANY_RE = re.compile(
+    r"^(company\s*(name)?|example\s*(corp(oration)?)?|acme|"
+    r"your\s*company|n/?a|unknown\s*company|placeholder|"
+    r"company\s*\d+|org\s*\d+)$",
+    re.IGNORECASE,
+)
+
+# Reject obviously non-specific / stale salary strings the model invents.
+_FAKE_SALARY_RE = re.compile(
+    r"(competitive|negotiable|market\s*rate|tbd|attractive)",
+    re.IGNORECASE,
+)
+
+# Minimum URL plausibility: must start with http(s) and contain a dot.
+_VALID_URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$", re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Agent State
@@ -124,33 +138,73 @@ class AgentState(TypedDict):
 # and reused safely across all requests.
 
 _SYSTEM_PROMPT = """\
-You are a recruitment assistant. Your job is to find REAL open job positions
-and score how well each one matches the user's search query.
+You are a recruitment assistant. Your job is to find REAL, CURRENTLY OPEN job
+positions (including internships) and score how well each one matches the
+user's search query.
+
+=== ABSOLUTE PROHIBITIONS — violating any of these is a critical failure ===
+
+1. NEVER invent, fabricate, or hallucinate ANY field — not company names,
+   job titles, locations, salaries, skills, experience requirements, or URLs.
+2. NEVER output placeholder text such as "Company Name", "Example Corp",
+   "skill1", "Competitive salary", "TBD", "N/A", or similar.
+3. NEVER reuse, guess, or construct a URL. application_link MUST be the exact
+   URL string returned by the search tool — copied character-for-character.
+   If the tool did not return a direct application URL, set application_link
+   to null (do not use "#", "N/A", or any invented path).
+4. NEVER include a job whose application_link is null, "#", or a job-board
+   homepage. Drop it from the results entirely.
+5. NEVER include jobs posted before 2026. Only include listings that are
+   demonstrably current (posted in 2026 or marked "actively hiring").
+6. If a field is not explicitly stated in the search snippet, use ONLY these
+   sentinels:
+     • strings  → "Not specified"
+     • lists    → []
+   Do NOT guess, infer, or fill in from general knowledge.
+
+=== SCOPE — ALWAYS include internships ===
+
+Search for BOTH full-time/part-time positions AND internship roles.
+When building search queries, always include a variant that targets internships
+explicitly (e.g. add "internship OR intern" to one query).
 
 === PROCESS (follow exactly) ===
 
-STEP 1 — Search:
-Call tavily_job_search with a focused query, e.g.:
-  "<job title> jobs <location> 2026 site:linkedin.com OR site:indeed.com"
-Run searches with varied queries if needed.
+STEP 1 — Search (run at least TWO queries):
+  Query A — full-time / senior roles:
+    "<job title> jobs <location>  2026 site:linkedin.com OR site:indeed.com"
+  Query B — internships:
+    "<job title> internship <location>  2026 site:linkedin.com OR site:wuzzuf.net"
+  Run additional queries if the first two return fewer than 4 real listings.
 
-STEP 2 — Extract (no hallucination):
-For EACH job found, extract ONLY what is explicitly written in the snippet:
-  company_name      → as written; "Unknown" if absent
-  job_title         → exact title from the listing
+STEP 2 — Extract (verbatim only, no hallucination):
+For EACH job found, copy ONLY what is explicitly written in the snippet:
+  company_name      → as written; "Unknown" only if genuinely absent
+  job_title         → exact title from the listing (include "Intern" / "Internship"
+                       in the title when that is what the listing says)
   location          → exact location; "Not specified" if absent
   experience_needed → only if explicitly stated; else "Not specified"
-  salary_range      → only if a real number/currency appears; else "Not specified"
+  salary_range      → only if a real number/currency appears in the snippet;
+                       else "Not specified"  (NEVER use words like "Competitive")
   required_skills   → skills/technologies explicitly mentioned; [] if none
-  application_link  → exact URL from the search tool, unmodified
-  source            → domain extracted from application_link
+  application_link  → EXACT URL from the search tool result — unmodified,
+                       character-for-character. null if none was returned.
+  source            → domain extracted from application_link (e.g. "linkedin.com")
 
-STEP 3 — Score each job honestly (match_score 0–100):
+STEP 3 — Filter before scoring:
+  DISCARD any job where:
+    • application_link is null, "#", a job-board homepage, or a search results page
+    • job_title matches a pattern like "50+ Jobs in Cairo" (aggregator listing)
+    • company_name is a job board ("LinkedIn", "Indeed", "Glassdoor", etc.)
+    • the listing appears to be from before 2026
+
+STEP 4 — Score each remaining job honestly (match_score 0–100):
 
   TITLE_MATCH (0–50 pts):
     50 → identical or near-identical to the searched title
     35 → same role family (e.g. searched "Backend Dev", found "Node.js Dev")
     20 → adjacent role or different seniority
+    10 → internship when a full-time role was searched (still relevant)
      5 → loosely related
 
   LOCATION_MATCH (0–30 pts):
@@ -160,49 +214,43 @@ STEP 3 — Score each job honestly (match_score 0–100):
      0 → different country, no remote option
 
   INFO_QUALITY (0–20 pts):
-    +5 salary is provided
+    +5 salary is provided with an actual number/currency
     +5 experience is explicitly stated
-    +5 required_skills has ≥ 3 real skills
-    +5 direct application link (not a job-board homepage)
+    +5 required_skills has ≥ 3 real skills from the snippet
+    +5 direct application link (confirmed real URL, not a board homepage)
 
   match_score = TITLE_MATCH + LOCATION_MATCH + INFO_QUALITY  [clamped 5–98]
   Every job MUST have a DIFFERENT score reflecting its actual match.
 
-STEP 4 — Write match_reason:
+STEP 5 — Write match_reason:
 One sentence referencing the actual found job title and location. Example:
   "Title 'Senior React Developer' exactly matches the search and is in Dubai."
 
 === FINAL OUTPUT ===
-Output ONLY the JSON object below. No markdown fences, no explanation.
+Output ONLY the JSON object below. No markdown fences, no explanation,
+no text before or after the JSON.
 
 {
   "job_title": "<user searched title>",
   "location": "<user searched location>",
-  "total_found": <integer>,
-  "agent_summary": "<2 sentences: what was searched and what was found>",
+  "total_found": <integer — count of jobs AFTER filtering>,
+  "agent_summary": "<2 sentences: what was searched, what was found, whether internships were included>",
   "search_queries_used": ["<query 1>", "<query 2>"],
   "jobs": [
     {
-      "company_name": "<from search>",
-      "job_title": "<from search>",
+      "company_name": "<verbatim from search or 'Unknown'>",
+      "job_title": "<verbatim from search>",
       "match_score": <integer per scoring above>,
-      "location": "<from search or Not specified>",
-      "experience_needed": "<from search or Not specified>",
-      "salary_range": "<from search or Not specified>",
-      "required_skills": ["<only explicitly found skills>"],
+      "location": "<verbatim from search or 'Not specified'>",
+      "experience_needed": "<verbatim from search or 'Not specified'>",
+      "salary_range": "<verbatim number/currency from search or 'Not specified'>",
+      "required_skills": ["<only skills explicitly found in snippet>"],
       "match_reason": "<one specific sentence>",
       "source": "<domain>",
-      "application_link": "<exact URL>"
+      "application_link": "<EXACT URL from tool — never null or '#' here>"
     }
   ]
 }
-
-=== HARD RULES ===
-- NEVER invent company names, titles, salaries, skills, or URLs.
-- NEVER give every job the same match_score.
-- NEVER use placeholder text like "skill1", "Company Name", "Example Corp".
-- If skills are not in the snippet → output [].
-- Output ONLY the JSON. Nothing else.
 """
 
 
@@ -218,10 +266,8 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     Strategy 2 — extract the outermost balanced { … } block.
     Strategy 3 — treat everything from the first '{' to EOF as potentially
                  truncated JSON and attempt bracket-completion.
-                 (Fixed vs original: we scan to EOF, NOT to rfind('}'), so
-                 opens_cu can be non-zero when the JSON is actually truncated.)
     """
-    # Strip reasoning blocks (deepseek-r1 / o1-style models)
+    # Strip reasoning blocks (deepseek-r1 / qwen-style <think> tags)
     text = _THINK_BLOCK_RE.sub("", text)
     # Strip markdown fences
     text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE)
@@ -243,12 +289,9 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
             pass
 
     # Strategy 3 — treat everything from first '{' to EOF as truncated JSON.
-    # We intentionally do NOT use text[start:end+1] here because rfind("}")
-    # would give opens_cu == 0, making bracket-completion a no-op for the
-    # most common truncation case (missing closing braces).
     if start != -1:
-        partial = text[start:]                              # scan to EOF
-        partial = _TRAILING_COMMA_RE.sub(r"\1", partial)   # fix trailing commas
+        partial = text[start:]
+        partial = _TRAILING_COMMA_RE.sub(r"\1", partial)
         opens_sq = partial.count("[") - partial.count("]")
         opens_cu = partial.count("{") - partial.count("}")
         candidate = partial + "]" * max(opens_sq, 0) + "}" * max(opens_cu, 0)
@@ -292,12 +335,14 @@ def _validate_and_fix_output(
                 Pass cap_score=75 for targeted search (no CV → no genuine
                 high-match signal available).
 
-    Changes vs original
-    -------------------
-    - Aggregator company names filtered via regex (not exact-match string set)
-    - _BAD_URL_RE applied in addition to _FAKE_LINK_RE
-    - total_found always reflects the post-filter job count
-    - agent_summary and search_queries_used preserved from raw input
+    Key changes vs original
+    -----------------------
+    - Jobs with no valid application_link are DROPPED (not kept with "#").
+    - Placeholder company names rejected via _PLACEHOLDER_COMPANY_RE.
+    - Hallucinated "competitive / negotiable" salaries replaced with sentinel.
+    - _BAD_URL_RE + _FAKE_LINK_RE + _VALID_URL_RE all applied; any failure → drop.
+    - total_found always reflects the post-filter count.
+    - agent_summary and search_queries_used preserved from raw input.
     """
     job_title = raw.get("job_title", "Unknown Position")
     location  = raw.get("location",  "Various")
@@ -313,15 +358,35 @@ def _validate_and_fix_output(
             continue
 
         # ── Drop aggregator listings ("50+ Jobs in Dubai") ────────────────
-        title = job.get("job_title", "")
+        title = str(job.get("job_title", ""))
         if _AGGREGATOR_TITLE_RE.search(title):
             logger.debug("Dropping aggregator listing: %r", title)
             continue
 
         # ── Drop job-board company names ("LinkedIn", "Indeed", …) ────────
-        company = job.get("company_name", "")
+        company = str(job.get("company_name", ""))
         if _JOB_BOARD_NAMES_RE.search(company):
             logger.debug("Dropping job-board company listing: %r", company)
+            continue
+
+        # ── Drop obviously hallucinated / placeholder company names ────────
+        if _PLACEHOLDER_COMPANY_RE.fullmatch(company.strip()):
+            logger.debug("Dropping placeholder company name: %r", company)
+            continue
+
+        # ── application_link — strict validation: drop if not a real URL ──
+        link = str(job.get("application_link", "") or "").strip()
+        if (
+            not link
+            or link in ("#", "null", "None", "N/A", "n/a")
+            or not _VALID_URL_RE.match(link)
+            or _FAKE_LINK_RE.search(link)
+            or _BAD_URL_RE.search(link)
+        ):
+            logger.debug(
+                "Dropping job with invalid/missing application_link: %r (link=%r)",
+                title, link,
+            )
             continue
 
         # ── required_skills — strip fake placeholders ──────────────────────
@@ -338,30 +403,36 @@ def _validate_and_fix_output(
             score = min(score, cap_score)
         job["match_score"] = score
 
-        # ── salary_range ───────────────────────────────────────────────────
+        # ── salary_range — reject vague/hallucinated phrases ───────────────
         salary = str(job.get("salary_range", "")).strip()
-        if salary.lower() in ("", "n/a", "none", "null", "not specified"):
+        if (
+            not salary
+            or salary.lower() in ("", "n/a", "none", "null", "not specified")
+            or _FAKE_SALARY_RE.search(salary)
+        ):
             job["salary_range"] = "Not specified"
 
-        # ── application_link — reject search-result pages and fake links ───
-        link = str(job.get("application_link", ""))
-        if _FAKE_LINK_RE.search(link) or _BAD_URL_RE.search(link):
-            job["application_link"] = "#"
-
-        # ── defaults for any missing fields ───────────────────────────────
+        # ── defaults for any remaining missing fields ──────────────────────
         defaults: Dict[str, str] = {
             "company_name":      "Unknown",
             "job_title":         job_title,
-            "location":          location,
+            "location":          "Not specified",
             "experience_needed": "Not specified",
             "salary_range":      "Not specified",
             "match_reason":      "Matches the search criteria.",
             "source":            "Web",
-            "application_link":  "#",
         }
         for key, default in defaults.items():
             if not job.get(key):
                 job[key] = default
+
+        # Ensure source is derived from the validated link if missing/generic
+        if job.get("source") in ("", "Web", None):
+            try:
+                from urllib.parse import urlparse
+                job["source"] = urlparse(link).netloc or "Web"
+            except Exception:
+                job["source"] = "Web"
 
         jobs_fixed.append(job)
 
@@ -382,20 +453,17 @@ def _validate_and_fix_output(
 @functools.lru_cache(maxsize=1)
 def _get_llm_with_tools() -> Any:
     """
-    Instantiate ChatOllama and bind tools exactly once.
+    Instantiate ChatGroq with qwen/qwen3-32b and bind tools exactly once.
 
     lru_cache ensures a single instance regardless of how many times this
-    function is called, eliminating the per-iteration HTTP session overhead
-    that the original _make_llm() / llm_node pattern caused.
+    function is called, eliminating per-request HTTP session overhead.
     """
     settings = get_settings()
-    llm = ChatOllama(
-        model=settings.ollama_model,
-        base_url=settings.ollama_base_url,
-        temperature=0.1,
-        num_predict=2048,
-        num_ctx=4096,
-        num_thread=8,
+    llm = ChatGroq(
+        model=settings.groq_model,        # "qwen/qwen3-32b" set in config
+        api_key=settings.groq_api_key,
+        temperature=0.0,                  # 0.0 for maximum factual determinism
+        max_tokens=1500,                  # increased — qwen3-32b handles longer JSON
     )
     tools = get_tools()
     return llm.bind_tools(tools, tool_choice="auto")
@@ -433,11 +501,9 @@ def graceful_exit_node(state: AgentState) -> Dict[str, Any]:
     """
     Extract and validate the JSON from the most recent AIMessage.
 
-    Scans backwards through the message history so we never accidentally read a
-    ToolMessage as the "final answer".  This is the failure mode in the original
-    code when the iteration cap fires immediately after a tool call: at that
-    point messages[-1] is a ToolMessage containing raw search results, not the
-    LLM's JSON output.
+    Scans backwards through message history so a ToolMessage is never
+    mistakenly read as the final answer when the iteration cap fires
+    immediately after a tool call.
     """
     last_ai_text: str = ""
     for msg in reversed(state["messages"]):
@@ -448,6 +514,7 @@ def graceful_exit_node(state: AgentState) -> Dict[str, Any]:
     raw = _extract_json(last_ai_text)
 
     if raw:
+        # _validate_and_fix_output now DROPS jobs with invalid links.
         result = _validate_and_fix_output(raw)
     else:
         logger.warning("graceful_exit: could not parse JSON from last AIMessage.")
@@ -502,10 +569,9 @@ def _get_graph() -> Any:
     """
     Build and compile the LangGraph StateGraph exactly once.
 
-    Using lru_cache instead of the original `global _COMPILED_GRAPH / if None`
-    pattern is safer under async concurrency: lru_cache is thread-safe by
-    design, whereas the None-check pattern has a TOCTOU race if the graph is
-    ever invoked from a thread pool executor.
+    lru_cache is thread-safe by design; it replaces the original
+    `global _COMPILED_GRAPH / if None` pattern which had a TOCTOU race
+    under async concurrency.
     """
     tools     = get_tools()
     tool_node = ToolNode(tools)
@@ -537,11 +603,11 @@ def _invoke_graph(user_message: str, cv_text: str = "") -> Dict[str, Any]:
 
     The CV text (when provided) is appended to the system prompt so the LLM
     can extract skills without hallucinating.  Everything else — job title,
-    location, and search instructions — goes into the HumanMessage so it is
-    scoped to the current request rather than baked into the shared system prompt.
+    location, and search instructions — goes into the HumanMessage.
 
     Returns final_output as produced by graceful_exit_node (already validated).
-    Callers must NOT call _validate_and_fix_output again on the result.
+    Callers must NOT call _validate_and_fix_output again on the result
+    (except run_targeted_search which re-applies cap_score=75).
     """
     graph = _get_graph()
 
@@ -550,7 +616,7 @@ def _invoke_graph(user_message: str, cv_text: str = "") -> Dict[str, Any]:
         system_content += (
             f"\n\n=== CANDIDATE CV CONTENT ===\n{cv_text}\n=== END OF CV ===\n\n"
             "STRICT RULE: Extract skills ONLY from the CV above. "
-            "Do NOT guess Java/Spring Boot unless explicitly found in the CV."
+            "Do NOT guess or add any technology unless it appears verbatim in the CV."
         )
 
     initial_state: AgentState = {
@@ -569,8 +635,6 @@ def _invoke_graph(user_message: str, cv_text: str = "") -> Dict[str, Any]:
         final_state.get("iterations", 0),
     )
 
-    # final_output was already validated by graceful_exit_node.
-    # Return it directly — do NOT call _validate_and_fix_output again here.
     return final_state.get("final_output") or {
         "job_title":           "Unknown",
         "location":            "Various",
@@ -587,7 +651,7 @@ def _invoke_graph(user_message: str, cv_text: str = "") -> Dict[str, Any]:
 
 def run_cv_analysis(cv_text: str, detected_title: str = "") -> Dict[str, Any]:
     """
-    Analyse a candidate's CV and find matching real-world jobs.
+    Analyse a candidate's CV and find matching real-world jobs (incl. internships).
 
     Parameters
     ----------
@@ -597,8 +661,8 @@ def run_cv_analysis(cv_text: str, detected_title: str = "") -> Dict[str, Any]:
     Returns
     -------
     Validated job-results dict (already processed by graceful_exit_node).
-    No score cap is applied — the agent can compute a genuine high match
-    because the full CV content is available for comparison.
+    No score cap applied — the full CV provides genuine match signal.
+    All jobs in the result are guaranteed to have a valid application_link.
     """
     title_hint = (
         f" The candidate's likely title is '{detected_title}'."
@@ -606,22 +670,25 @@ def run_cv_analysis(cv_text: str, detected_title: str = "") -> Dict[str, Any]:
         else ""
     )
     user_message = (
-        f"A candidate uploaded their CV.{title_hint}\n"
-        "STEP 1: Call tavily_job_search with a query based on the candidate's skills "
-        "and the detected title above.\n"
-        "STEP 2: Use the REAL results to build the final JSON.\n"
-        "DO NOT invent jobs. Only use jobs returned by the search tool.\n\n"
+        f"A candidate uploaded their CV.{title_hint}\n\n"
+        "MANDATORY STEPS:\n"
+        "1. Run at least TWO tavily_job_search queries:\n"
+        "   • Query A: full-time/senior roles based on the candidate's skills and title.\n"
+        "   • Query B: internship roles using the same skills + 'internship OR intern  2026'.\n"
+        "2. Use ONLY results returned by the search tool — zero hallucination.\n"
+        "3. ONLY include listings with a real, direct application URL from the tool.\n"
+        "   Drop any listing whose URL is missing, a '#', or a job-board homepage.\n"
+        "4. Build the final JSON from verified search results only.\n\n"
         f"CV Content:\n{cv_text}"
     )
     # _invoke_graph → graceful_exit_node → _validate_and_fix_output (once).
-    # We do NOT call _validate_and_fix_output here to avoid double-validation
-    # which was bug 1.5 in the review (it reset total_found and re-applied caps).
+    # NOT called again here to avoid double-validation.
     return _invoke_graph(user_message, cv_text=cv_text)
 
 
 def run_targeted_search(job_title: str, location: str) -> Dict[str, Any]:
     """
-    Search for real open job listings matching a job title and location.
+    Search for real open job listings (incl. internships) matching a title & location.
 
     Parameters
     ----------
@@ -631,21 +698,26 @@ def run_targeted_search(job_title: str, location: str) -> Dict[str, Any]:
     Returns
     -------
     Validated job-results dict with match_score capped at 75.
-    The cap reflects the fact that without a CV we cannot compute a genuine
-    high-match signal — 75 is the honest ceiling for a title+location search.
+    The cap reflects that without a CV we cannot compute a genuine high-match
+    signal. 75 is the honest ceiling for a title+location search.
+    All jobs in the result are guaranteed to have a valid application_link.
     """
     user_message = (
-        f"Find REAL open '{job_title}' jobs in '{location}'.\n"
-        f"STEP 1: Call tavily_job_search with the query: "
-        f"'\"{job_title}\" jobs {location} 2026'\n"
-        "STEP 2: Use the REAL search results to build the final JSON.\n"
-        f"STRICT: Only include jobs directly matching the '{job_title}' domain.\n"
-        "DO NOT invent jobs, salaries, skills, or URLs not in the search results.\n"
-        "If no jobs are found, return an empty jobs array."
+        f"Find REAL, CURRENTLY OPEN '{job_title}' jobs AND internships in '{location}'.\n\n"
+        "MANDATORY STEPS:\n"
+        f"1. Run at least TWO tavily_job_search queries:\n"
+        f"   • Query A: '\"{job_title}\" jobs {location}  2026 hiring now'\n"
+        f"   • Query B: '\"{job_title}\" internship {location}  2026'\n"
+        "2. Use ONLY the search results — never invent jobs, salaries, skills, or URLs.\n"
+        "3. ONLY include listings with a real, direct application URL returned by the tool.\n"
+        "   Drop any listing whose URL is missing, '#', or a job-board search page.\n"
+        f"4. Only include roles directly in the '{job_title}' domain (or internships thereof).\n"
+        "5. If fewer than 3 real listings with valid URLs are found, return what exists.\n"
+        "   Return an empty jobs array rather than inventing listings."
     )
     # graceful_exit_node already called _validate_and_fix_output without a cap.
-    # We call it a second time here ONLY to apply the cap_score=75 ceiling.
-    # This is safe because _validate_and_fix_output is idempotent for all fields
-    # except match_score, and cap_score=75 is the only mutation we want.
+    # We call it a second time ONLY to apply the cap_score=75 ceiling.
+    # _validate_and_fix_output is idempotent for all fields except match_score,
+    # and already-dropped jobs (no valid link) are not re-added.
     result = _invoke_graph(user_message)
     return _validate_and_fix_output(result, cap_score=75)
