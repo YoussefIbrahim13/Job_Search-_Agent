@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("🤖 Recruitment AI Agent System — Starting Up")
+
+    
+
+    
     logger.info("  LLM model:    %s", settings.groq_model)
     
     
@@ -36,6 +40,29 @@ async def lifespan(app: FastAPI):
     logger.info("✅ Configuration validated. Agent ready.")
     yield
     logger.info("🛑 Shutting Down")
+
+
+
+
+
+    # logger.info("  LLM model:    %s", settings.ollama_model)
+    # import requests
+    # try:
+    #     requests.get(settings.ollama_base_url, timeout=2)
+    #     logger.info("✅ Ollama is reachable.")
+    # except Exception:
+    #     logger.warning(f"⚠️ Cannot connect to Ollama at {settings.ollama_base_url}. Make sure it's running!")
+
+    # if not settings.tavily_api_key:
+    #     logger.error("TAVILY_API_KEY is not set!")
+    #     sys.exit(1)
+
+    # logger.info("✅ Configuration validated. Agent ready.")
+    # yield
+    # logger.info("🛑 Shutting Down")
+
+
+
 
 app = FastAPI(title="Recruitment AI Agent API", lifespan=lifespan)
 

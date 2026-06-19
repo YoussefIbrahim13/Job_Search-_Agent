@@ -679,10 +679,34 @@ function switchTab(mode) {
 
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('cv-file-input');
+const ALLOWED_CV_EXTENSIONS = ['.pdf', '.docx', '.doc'];
+
+function getFileExtension(filename) {
+  const idx = filename.lastIndexOf('.');
+  return idx === -1 ? '' : filename.slice(idx).toLowerCase();
+}
+
+function validateAndSetFile(file) {
+  if (!file) return;
+  const ext = getFileExtension(file.name);
+  if (!ALLOWED_CV_EXTENSIONS.includes(ext)) {
+    showError('cv', 'Unsupported file type "' + (ext || 'unknown') + '". Please upload a PDF, DOCX, or DOC file.');
+    removeFile();
+    return;
+  }
+  document.getElementById('cv-error').classList.remove('visible');
+  setFile(file);
+}
+
 dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
 dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
-dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('dragover'); const f = e.dataTransfer.files[0]; if (f) setFile(f); });
-fileInput.addEventListener('change', () => { if (fileInput.files[0]) setFile(fileInput.files[0]); });
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  const f = e.dataTransfer.files[0];
+  if (f) validateAndSetFile(f);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files[0]) validateAndSetFile(fileInput.files[0]); });
 function setFile(file) { selectedFile = file; document.getElementById('file-selected').style.display = 'flex'; document.getElementById('file-name-display').textContent = file.name; }
 function removeFile() { selectedFile = null; fileInput.value = ''; document.getElementById('file-selected').style.display = 'none'; }
 
@@ -786,7 +810,7 @@ function renderResults(data) {
   if (isCvMode && data.profile) {
     const p = data.profile;
     profileSection.style.display = 'block';
-    document.getElementById('r-name').textContent = p.name || 'CANDIDATE';
+    document.getElementById('r-name').textContent = p.detected_title || 'CANDIDATE';
     document.getElementById('r-level').textContent = p.experience_level || '';
     const skillsEl = document.getElementById('r-skills');
     skillsEl.innerHTML = '';

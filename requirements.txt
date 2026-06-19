@@ -10,7 +10,7 @@ langchain
 langchain-core
 langchain-groq
 langgraph
-
+langchain-ollama
 # ── Tools & Search ──
 tavily-python
 httpx
