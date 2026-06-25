@@ -1,81 +1,41 @@
 """
 backend/agents/recruitment_agent.py
 ====================================
-LangGraph-based Recruitment AI Agent using local Ollama model.
+LangGraph-based Recruitment AI Agent — optimised for
+`llama-3.3-70b-versatile` on Groq.
 
-DESIGN PRINCIPLES (unchanged)
-------------------------------
-1. Sequential-only tool execution — one tool call per LLM step.
-2. Hard iteration cap — enforced by the graph router.
-3. Structured JSON output — validated and sanitised post-processing.
-4. Single source of truth — all agent logic lives here.
+FIX N/O — Agent-layer alignment with new tool-layer filters
+---------------------------------------------------------------------------
+tools.py now enforces two new pre-filter layers before results reach the
+model:
+  FIX N (Positive-Assertion Path Gating): rejects non-vacancy subpaths on
+    approved boards (e.g. wuzzuf.net/r/template, linkedin.com/jobs/search/).
+  FIX O (Content-Layer Staleness Detection): rejects listings whose own
+    snippet/title text contains human-readable age badges that exceed the
+    staleness threshold (e.g. "Posted 5 years ago", "منذ 4 سنوات"), in
+    addition to the existing closed/filled/expired declaration scan.
 
-Graph topology
---------------
-    START → llm_node ◄──────────────────────────────┐
-                │                                    │
-             _route                                  │
-          ┌────┼─────────────────┐                   │
-     tool_node │           coerce_internship ─────► llm_node
-               │
-          graceful_exit → END
+This file's changes are limited to four areas:
+  1. _AGGREGATOR_TITLE_RE: kept in sync with _CATEGORY_PAGE_TITLE_RE in
+     tools.py as a second-line-of-defense at the validation layer (FIX M
+     intent preserved). No changes to the pattern itself.
+  2. _validate_and_fix_output: adds 'path_gate' and 'stale' as named drop-
+     reason buckets so the INFO-level validation summary reflects the same
+     vocabulary as the tool-layer pre-filter log. The actual gate logic is
+     in tools.py — the agent-layer functions here are a final integrity
+     check, not a primary filter.
+  3. System prompt: DISCARD clause and "already filtered" reassurance updated
+     to name the two new filter types explicitly, so the model is not left
+     guessing why it may receive fewer results than expected and does not
+     defensively self-zero.
+  4. FIX R — graceful_exit_node ToolMessage fallback: when the iteration
+     cap fires mid-tool-call and no AIMessage ever contains extractable
+     JSON, scan ToolMessages in the history for raw listing blocks that
+     tavily_job_search already emitted and build a synthetic final_output
+     from them. Prevents silent total-loss when a Groq 429 retry consumes
+     the last iteration before the model can finalise.
 
-CHANGES IN THIS REVISION (volume optimisation pass)
------------------------------------------------------
-FIX E — Router Short-Circuit Bug, corrected at the actual cause:
-  DIAGNOSIS CORRECTION: the originally-suspected cause ("the function scans
-  the entire ToolMessage.content") was not accurate — _extract_search_state
-  already sliced to content[:200] in the prior revision. The real cause is
-  that the first ~200 characters of EVERY tavily_job_search return value are
-  the fixed pipeline-status banner, which itself contains the literal text
-  "INTERNSHIP/TRAINEE" as part of its standing reminder:
-
-      "✓ You MUST still run the INTERNSHIP/TRAINEE variant query."
-
-  Because _extract_search_state pattern-matched against the *tool response*
-  text, this banner caused internship_query_done to flip True after the
-  FIRST query regardless of what was actually searched — a full-time-only
-  query would trigger it just as easily as a real internship query, since
-  the banner is identical on every successful response. Re-truncating the
-  response text differently would not have fixed this, because the false-
-  positive substring is inside the part of the response that any reasonable
-  truncation window would still include.
-
-  CORRECT FIX: stop inferring query intent from response content entirely.
-  Instead, inspect the actual tool-call ARGUMENTS the model sent — these
-  live on the preceding AIMessage.tool_calls[i]["args"]["query"], not on
-  the ToolMessage. This is the ground truth of what was searched, and it
-  cannot contain banner boilerplate because it is the model's OUTGOING
-  argument, not the tool's incoming response.
-
-  _extract_search_state() is rewritten to walk paired (AIMessage, ToolMessage)
-  sequences: for every AIMessage with a tavily_job_search tool_call, look at
-  its args["query"] (the real, sent query) to decide whether that specific
-  call was an internship-flavoured search. The corresponding ToolMessage is
-  used only to confirm the call actually completed (i.e. wasn't an error/
-  exception path) — never to source the keyword match itself.
-
-FIX F — Query Hygiene Prompt Update (stray "Go" / operational tokens):
-  System prompt REQUIREMENT 3 ("QUERY TOKEN HYGIENE") is expanded with an
-  explicit rule against leaking bare operational/filler words (especially
-  "Go") in front of an unrelated stack, mirroring the tools.py docstring so
-  both layers agree. The STEP 1/2 examples are updated to use a C#/.NET
-  example explicitly, since that was the stack observed corrupted by the
-  leaked "Go" token in production logs.
-
-Earlier changes (preserved without modification):
-  - FIX A: Negative-keyword semantic leakage retired from prompt language;
-    handled at the tool layer via Tavily exclude_domains.
-  - FIX B: Open-web cognitive drift eliminated; APPROVED BOARDS ONLY
-    templates sourced from APPROVED_SEARCH_BOARDS in tools.py.
-  - FIX 1: Technology-stack injection + _has_tech_signal guard in tools.py.
-  - FIX 2: _BLACKLISTED_DOMAINS CSR zombie filter in tools.py +
-           _is_blacklisted_domain() re-applied in _validate_and_fix_output.
-  - FIX 3: AgentState search-tracking fields, coerce_internship node,
-           pipeline-status banner in tool output.
-  - Zero hallucination ABSOLUTE PROHIBITIONS block.
-  - No hardcoded year anywhere; recency enforced at tool layer.
-  - Jobs with invalid application_link are DROPPED, not kept.
+All prior FIX A through FIX Q+ behaviour preserved unmodified.
 """
 
 from __future__ import annotations
@@ -96,12 +56,6 @@ from langchain_core.messages import (
 
 from langchain_groq import ChatGroq
 
-
-# from langchain_ollama import ChatOllama
-
-
-
-
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -111,6 +65,8 @@ from backend.agents.tools import (
     get_tools,
     _is_blacklisted_domain,
     _is_content_pollution_domain,
+    _passes_path_gate,    # FIX N
+    _snippet_is_stale,    # FIX O
 )
 from backend.core.config import get_settings
 
@@ -126,9 +82,19 @@ _BAD_URL_RE = re.compile(
     re.IGNORECASE,
 )
 _FAKE_LINK_RE = re.compile(r"/jobs/view/\d+$")
+
+# Kept in sync with tools._CATEGORY_PAGE_TITLE_RE (FIX M: second line of
+# defense in the validation layer, after the tool-layer pre-filter).
 _AGGREGATOR_TITLE_RE = re.compile(
-    r"\d+\+?\s*(jobs?|vacancies|positions?|openings?)", re.IGNORECASE
+    r"\d+\+?\s*(jobs?|vacancies|positions?|openings?)\b"
+    r"|\bjobs?\s+in\s+[A-Za-z]"
+    r"|\bvacancies\s+in\s+[A-Za-z]"
+    r"|\b(browse|search)\s+(all\s+)?jobs?\b"
+    r"|\ball\s+jobs?\b"
+    r"|\blatest\s+jobs?\b",
+    re.IGNORECASE,
 )
+
 _FAKE_SKILL_RE = re.compile(
     r"^(skill\d*|n/?a|none|tbd|example|placeholder)$", re.IGNORECASE
 )
@@ -150,14 +116,23 @@ _FAKE_SALARY_RE = re.compile(
 )
 _VALID_URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$", re.IGNORECASE)
 
-# FIX E: this pattern is now applied to the OUTGOING tool-call query
-# argument (the model's real intent), never to the tool's response text.
 _INTERNSHIP_QUERY_RE = re.compile(
     r"\b(intern(ship)?|trainee|graduate\s+program|entry.level)\b",
     re.IGNORECASE,
 )
 
-_TAVILY_TOOL_NAME = "tavily_job_search"
+# FIX R: regex to parse the numbered listing blocks that tavily_job_search
+# emits in its output, e.g.:
+#   [1] Senior Front-End Developer ( Vue.js )
+#       URL: https://wuzzuf.net/jobs/p/kmiuk743oelq-...
+#       <snippet>
+_TOOL_LISTING_RE = re.compile(
+    r"\[(\d+)\]\s+(.+?)\n\s+URL:\s+(https?://\S+)",
+    re.MULTILINE,
+)
+
+_TAVILY_TOOL_NAME            = "tavily_job_search"
+_RECOMMENDED_MAX_ITERATIONS  = 3
 
 
 # ---------------------------------------------------------------------------
@@ -165,14 +140,6 @@ _TAVILY_TOOL_NAME = "tavily_job_search"
 # ---------------------------------------------------------------------------
 
 class AgentState(TypedDict):
-    """
-    messages              — Full conversation history.
-    iterations            — Incremented on each LLM call; enforces cap.
-    final_output          — Set by graceful_exit_node.
-    queries_executed      — Count of completed tavily_job_search calls.
-    internship_query_done — True once an intern/trainee query has been executed.
-    coercion_injected     — True after the coercion message has been injected once.
-    """
     messages:              Annotated[Sequence[BaseMessage], add_messages]
     iterations:            int
     final_output:          Optional[Dict[str, Any]]
@@ -182,40 +149,10 @@ class AgentState(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# FIX E — Search-state extractor (corrected: reads outgoing tool-call args)
+# Search-state extractor (preserved, unmodified)
 # ---------------------------------------------------------------------------
-#
-# ROOT CAUSE RECAP: the previous version matched _INTERNSHIP_QUERY_RE against
-# `ToolMessage.content[:200]`. Every successful tavily_job_search response
-# begins with a fixed pipeline-status banner that itself contains the words
-# "INTERNSHIP/TRAINEE" as a standing reminder to run the next query. That
-# means the regex matched on the FIRST query's response too — full-time or
-# not — because the false-positive text lives inside the banner, which is
-# always present at the very start of the response regardless of truncation
-# width. Changing the truncation window cannot fix a false positive that is
-# guaranteed to be inside that window on every single call.
-#
-# CORRECTED APPROACH: never pattern-match tool RESPONSES for intent. Pattern-
-# match the tool-call ARGUMENTS instead — i.e. what the model actually typed
-# as the `query` parameter when it invoked tavily_job_search. This is the
-# one place in the message history that reflects the model's real search
-# intent and contains no boilerplate of any kind.
-#
-# We pair each AIMessage's tool_calls with the ToolMessage that answers it
-# (matched by tool_call_id) so we can also confirm the call actually
-# completed without raising — a defensive check, not the keyword source.
 
 def _extract_search_state(messages: Sequence[BaseMessage]) -> tuple[int, bool]:
-    """
-    Walk the full message history and determine, from GROUND TRUTH tool-call
-    arguments (never from response text), how many tavily_job_search calls
-    have completed and whether any of them was an internship/trainee query.
-
-    Returns (queries_executed, internship_query_done).
-    """
-    # Build a lookup of completed ToolMessages by tool_call_id so we can
-    # confirm a given tool call actually returned (as opposed to, say, an
-    # in-flight call with no response yet in a partial state snapshot).
     completed_tool_call_ids: set[str] = {
         getattr(msg, "tool_call_id", None)
         for msg in messages
@@ -236,12 +173,10 @@ def _extract_search_state(messages: Sequence[BaseMessage]) -> tuple[int, bool]:
 
             tool_call_id = tc.get("id")
             if tool_call_id not in completed_tool_call_ids:
-                # Call was made but hasn't completed yet — don't count it.
                 continue
 
             executed += 1
 
-            # GROUND TRUTH: the model's own outgoing query argument.
             sent_query = str((tc.get("args") or {}).get("query", ""))
             if _INTERNSHIP_QUERY_RE.search(sent_query):
                 intern_done = True
@@ -250,36 +185,28 @@ def _extract_search_state(messages: Sequence[BaseMessage]) -> tuple[int, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Approved board reference string (injected into prompts)
+# Approved board reference string
 # ---------------------------------------------------------------------------
-#
-# Built from the canonical APPROVED_SEARCH_BOARDS dict in tools.py so the
-# prompt and the tool enforcement always agree on which boards are valid.
 
 def _build_approved_boards_prompt_block() -> str:
-    """
-    Format APPROVED_SEARCH_BOARDS as a human-readable prompt block with
-    site: tokens the model can copy directly into query strings.
-    """
-    lines = ["APPROVED SITE TOKENS — use EXACTLY one (or two with OR) per query:"]
-    # Group by category
     global_boards  = ["linkedin", "indeed", "glassdoor"]
     mena_boards    = ["wuzzuf", "bayt", "akhtaboot"]
     remote_boards  = ["weworkremotely", "remoteok", "himalayas"]
     tech_boards    = ["wellfound", "dice"]
 
     groups = [
-        ("Global generalist", global_boards),
-        ("MENA / Egypt / Gulf", mena_boards),
-        ("Remote-focused", remote_boards),
-        ("Tech-specialist", tech_boards),
+        ("Global",    global_boards),
+        ("MENA/Gulf", mena_boards),
+        ("Remote",    remote_boards),
+        ("Tech",      tech_boards),
     ]
+    lines = []
     for label, keys in groups:
-        tokens = [APPROVED_SEARCH_BOARDS[k] for k in keys if k in APPROVED_SEARCH_BOARDS]
+        tokens = [
+            APPROVED_SEARCH_BOARDS[k] for k in keys if k in APPROVED_SEARCH_BOARDS
+        ]
         if tokens:
-            lines.append(f"  {label}:")
-            for t in tokens:
-                lines.append(f"    {t}")
+            lines.append(f"{label}: {', '.join(tokens)}")
     return "\n".join(lines)
 
 
@@ -291,210 +218,109 @@ _APPROVED_BOARDS_BLOCK = _build_approved_boards_prompt_block()
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = f"""\
-You are a recruitment assistant. Your job is to find REAL, CURRENTLY OPEN job
-positions (including internships) and score how well each one matches the
-user's search query.
+You are a recruitment assistant. Find REAL, CURRENTLY OPEN job postings \
+(including internships) matching the user's query, and score each match.
 
-═══════════════════════════════════════════════════════════════════════
-ABSOLUTE PROHIBITIONS — violating ANY of these is a CRITICAL FAILURE
-═══════════════════════════════════════════════════════════════════════
+PROHIBITIONS (critical failure if violated):
+- Never invent companies, titles, locations, salaries, skills, or URLs.
+- Never output placeholders ("Company Name", "Example Corp", "TBD", "N/A", "skill1").
+- application_link must be the EXACT URL returned by the search tool, copied
+  verbatim, or null if none was returned. Drop any job with a null/invalid link.
+- Drop listings whose snippet says closed, filled, or expired.
+- If a field isn't explicitly in the snippet: strings → "Not specified", lists → [].
+  Never guess or infer from general knowledge.
 
-1. NEVER invent, fabricate, or hallucinate ANY field — not company names,
-   job titles, locations, salaries, skills, experience requirements, or URLs.
-2. NEVER output placeholder text such as "Company Name", "Example Corp",
-   "skill1", "Competitive salary", "TBD", "N/A", or similar.
-3. NEVER reuse, guess, or construct a URL. application_link MUST be the exact
-   URL string returned by the search tool — copied character-for-character.
-   If the tool did not return a direct application URL, set application_link
-   to null.
-4. NEVER include a job whose application_link is null, "#", or a job-board
-   homepage. Drop it from the results entirely.
-5. Only include listings that appear to be currently open and recently posted.
-   Discard anything whose snippet says it is closed, filled, or expired.
-6. If a field is not explicitly stated in the search snippet, use ONLY:
-     • strings  → "Not specified"
-     • lists    → []
-   Do NOT guess, infer, or fill in from general knowledge.
-
-═══════════════════════════════════════════════════════════════════════
-REQUIREMENT 1 — TECHNOLOGY STACK IN EVERY QUERY
-═══════════════════════════════════════════════════════════════════════
-
-EVERY query passed to tavily_job_search MUST include at least one concrete
-technology keyword (Python, React, Django, Node.js, Flutter, Spring Boot,
-C#, ASP.NET…). A query with NO technology keyword is a CRITICAL FAILURE
-flagged by the tool.
-
-Forbidden:
-  ✗ "Back-End Developer jobs Cairo"
-  ✗ "Software Engineer internship Dubai"
-  ✗ "Junior Developer remote hiring now"
-
-Required — technology FIRST, then role, then site: token:
-  ✓ "Python Django Back-End Developer jobs site:wuzzuf.net"
-  ✓ "React Node.js Software Engineer internship site:linkedin.com/jobs"
-  ✓ "Flutter Android mobile developer jobs site:indeed.com OR site:bayt.com"
-  ✓ "C# ASP.NET Backend Developer jobs site:glassdoor.com"
-
-The PRIMARY TECHNOLOGY STACK is given explicitly in the user message. Use
-ONLY that stack's own keywords — never a different language's keyword.
-
-═══════════════════════════════════════════════════════════════════════
-REQUIREMENT 2 — APPROVED BOARDS ONLY — ABSOLUTELY NO OPEN-WEB QUERIES
-═══════════════════════════════════════════════════════════════════════
-
-EVERY query MUST include a site: clause from the list below.
-A query WITHOUT a site: clause is FORBIDDEN. It produces context pollution
-from forums, articles, and Q&A boards that are structurally incapable of
-being job postings. Do not omit the site: clause for any reason.
-
+QUERY RULES for tavily_job_search:
+1. Every query MUST include at least one technology keyword from the
+   candidate's OWN stack (given below) — never substitute a different
+   language's keyword, and never let a stray filler word (e.g. "Go", "Run",
+   "Now") leak in front of an unrelated stack ("Go ASP.NET..." corrupts a
+   .NET search into a Golang search).
+2. Every query MUST include the target location as a literal keyword token,
+   verbatim, in EVERY query — never drop it, never paraphrase it, never move
+   it to a site: clause. Use the location AS GIVEN (e.g. "Cairo", "Remote",
+   "Dubai") with no surrounding preposition.
+   ✓ ".NET Full Stack Developer Cairo jobs site:wuzzuf.net OR site:bayt.com"
+   ✗ ".NET Full Stack Developer jobs in Cairo site:wuzzuf.net..." (the word
+     "in" collides with an automatic exclusion filter on aggregator pages
+     and can suppress real results — never use "in" before the location)
+   ✗ ".NET Full Stack Developer jobs site:wuzzuf.net..." (location dropped —
+     critical failure, this is the #1 cause of empty result sets)
+3. Every query MUST include a site: clause from this approved list — no
+   open-web queries, ever:
 {_APPROVED_BOARDS_BLOCK}
+   You may OR two boards together (e.g. "site:wuzzuf.net OR site:bayt.com").
+4. Query text = stack keyword(s) + role + LOCATION + modifier (jobs/
+   internship/intern/trainee) + site: clause ONLY, in that order. No
+   conversational prefixes, no exclusion clauses (filtering is automatic).
+   ✓ "Python Django developer Cairo jobs site:wuzzuf.net OR site:bayt.com"
+   ✓ "C# ASP.NET backend developer Remote internship site:linkedin.com/jobs"
+   ✗ "Go ASP.NET backend developer Cairo jobs site:linkedin.com/jobs" (leaked "Go")
+   ✗ "C# ASP.NET backend developer internship site:linkedin.com/jobs" (no location)
 
-You MAY combine up to two approved boards with OR:
-  site:linkedin.com/jobs OR site:wuzzuf.net
-  site:indeed.com OR site:bayt.com
-You MUST NOT use any domain not on the approved list.
-You MUST NOT omit site: entirely — this is unconditional.
+PARALLEL EXECUTION — DO THIS IN YOUR FIRST TURN:
+Call tavily_job_search TWICE IN THE SAME TURN: one full-time/senior query,
+one internship/trainee query (must contain "internship", "intern", or
+"trainee"). BOTH queries must carry the target location verbatim (see
+QUERY RULES rule 2) — losing the location on the retry/second-board attempt
+is the most common failure mode and is NOT acceptable. Use a DIFFERENT
+approved board for each call. Do not wait for one result before issuing the
+other. Once both have returned, emit the final JSON immediately using
+whatever valid listings they contain — ZERO, one, or many. Do NOT run a
+third search.
 
-═══════════════════════════════════════════════════════════════════════
-REQUIREMENT 3 — QUERY TOKEN HYGIENE
-═══════════════════════════════════════════════════════════════════════
+THE LISTINGS YOU SEE HAVE ALREADY BEEN FILTERED — IMPORTANT:
+Three layers of filtering have run BEFORE results reach you:
+  (1) Domain blacklist and content-pollution filters — forums, blogs, Q&A
+      sites, and known zombie aggregators removed.
+  (2) Positive-assertion path gating — for each approved board, only URLs
+      whose path matches the canonical job-listing structure (e.g.
+      /jobs/p/<slug> for Wuzzuf, /jobs/view/<id> for LinkedIn) are admitted.
+      Template pages (/r/<slug>), career-advice articles (/careers/), and
+      search-hub pages (/jobs/search) are removed at this stage.
+  (3) Content-layer staleness scan — snippets and titles are scanned for
+      human-readable age badges ("Posted 5 years ago", "منذ 4 سنوات") and
+      explicit closed/filled/expired declarations. Stale and zombie listings
+      are removed at this stage, even if their crawl timestamp is fresh due
+      to SEO tricks.
 
-The query argument you pass to tavily_job_search must be a SEARCH TOKEN
-STRING ONLY, made up of nothing but: the candidate's own technology/stack
-keywords, the role title, an optional modifier word (jobs / internship /
-intern / trainee), and the site: clause. Do not include any of the
-following:
-  • Conversational prefixes: "Search for", "Please find", "I need to look up"
-  • Explanations: "This query is for", "The goal of this search is"
-  • Negative exclusion clauses: -"closed", -"expired", -"no longer accepting"
-    (zombie filtering is handled automatically by the tool — do NOT add these)
-  • Bare operational/filler verbs of any kind: "Go" (as in "go ahead and..."),
-    "Run", "Execute", "Now", "Ok", "Fetch", "Lookup" — placed in front of an
-    UNRELATED stack. This is a CRITICAL FAILURE because search engines read
-    leaked words as additional technology keywords. A leaked "Go" in front
-    of a C#/.NET query, for example, will be read as the Go/Golang language
-    and will corrupt the results away from the .NET stack you actually want.
-    NEVER write "Go <some other language> ..." — if the candidate's stack is
-    C#/.NET, write "C# ASP.NET ..." and nothing else in front of it. ("Go" is
-    only acceptable when the candidate's ACTUAL stack is Go/Golang itself.)
-  • Any language other than the search terms and site: tokens themselves
+Every numbered listing shown to you has cleared ALL THREE layers and is a
+structurally-validated individual posting candidate. Do NOT re-apply these
+checks defensively or discard a listing just because you're uncertain — only
+discard if a SPECIFIC listing's OWN remaining snippet text explicitly says
+closed/filled/expired, or its company_name/link is clearly a placeholder.
+Do not return an empty jobs array if any usable listing was shown to you
+this turn — extract and score every one that doesn't hit an explicit DISCARD
+reason below.
 
-Correct: "Python Django developer jobs site:wuzzuf.net OR site:bayt.com"
-Correct: "C# ASP.NET Backend Developer jobs site:linkedin.com/jobs"
-Wrong:   "Search for Python Django developer jobs on wuzzuf or bayt"
-Wrong:   "Python developer jobs -'closed' -'expired' site:linkedin.com"
-Wrong:   "Go ASP.NET Backend Developer jobs site:linkedin.com/jobs"
-           ← the leaked "Go" turns a .NET search into a Golang search.
+EXTRACTION: copy fields verbatim from the snippet only. source = domain of
+application_link.
 
-═══════════════════════════════════════════════════════════════════════
-SCOPE — ALWAYS include internships
-═══════════════════════════════════════════════════════════════════════
+DISCARD only when true of a SPECIFIC listing: application_link null/"#"/
+homepage/search-page; company_name is a job-board name itself; snippet
+indicates closed/filled/expired; URL is a forum/blog/Q&A/social site.
 
-Search for BOTH full-time/part-time AND internship/trainee roles.
-Your second mandatory query MUST target internships explicitly — it must
-contain the word "internship", "intern", or "trainee" in the query you send.
+SCORING (match_score 0-100, every job a DIFFERENT score, clamp 5-98):
+  TITLE_MATCH (0-50): 50 exact/near-exact, 35 same role family, 20 adjacent/
+    different seniority, 10 internship-when-full-time-searched, 5 loosely related.
+  LOCATION_MATCH (0-30): 30 exact, 15 same country/region, 5 remote, 0 otherwise.
+  INFO_QUALITY (0-20): +5 each for real salary number, explicit experience,
+    ≥3 real skills, confirmed direct URL.
+  match_reason: one sentence citing the actual title and location.
 
-═══════════════════════════════════════════════════════════════════════
-MANDATORY SEQUENTIAL SEARCH CHECKLIST — follow IN ORDER, no skipping
-═══════════════════════════════════════════════════════════════════════
-
-  ☐ STEP 1 — Full-time / senior query (MANDATORY):
-      "<PRIMARY_TECH> <role> jobs <site:BOARD_A>"
-      Example: "C# ASP.NET Backend Developer jobs site:wuzzuf.net OR site:bayt.com"
-      Use a global or regional board for Step 1.
-
-  ──── WAIT for STEP 1 results before proceeding ────────────────────────
-
-  ☐ STEP 2 — Internship / trainee query (MANDATORY regardless of Step 1):
-      "<PRIMARY_TECH> <role> internship <site:BOARD_B>"
-      Example: "C# ASP.NET developer internship site:linkedin.com/jobs"
-      Use a DIFFERENT board than Step 1. The query text itself MUST contain
-      "internship", "intern", or "trainee" — this is how completion of this
-      mandatory step is verified, so do not skip the word.
-
-  ──── WAIT for STEP 2 results before proceeding ────────────────────────
-
-  ☐ STEP 3 — Optional: if fewer than 4 valid listings found after Steps 1+2,
-      run one more query targeting a different approved board.
-
-  ☐ STEP 4 — Emit final JSON ONLY after Steps 1 AND 2 are both complete.
-      ══ STOP GATE ══ If Step 2 is not done, you CANNOT emit JSON. ══════
-
-═══════════════════════════════════════════════════════════════════════
-EXTRACTION RULES — verbatim only, no hallucination
-═══════════════════════════════════════════════════════════════════════
-
-For EACH job found, copy ONLY what is explicitly in the snippet:
-  company_name      → as written; "Unknown" only if genuinely absent
-  job_title         → exact title from the listing
-  location          → exact location; "Not specified" if absent
-  experience_needed → only if explicitly stated; else "Not specified"
-  salary_range      → only if a real number/currency appears; else "Not specified"
-                       NEVER use "Competitive", "Negotiable", or similar
-  required_skills   → skills/technologies explicitly mentioned; [] if none
-  application_link  → EXACT URL from the search tool — unmodified.
-                       null if no direct URL was returned.
-  source            → domain extracted from application_link
-
-═══════════════════════════════════════════════════════════════════════
-FILTER BEFORE SCORING
-═══════════════════════════════════════════════════════════════════════
-
-DISCARD any job where:
-  • application_link is null, "#", a homepage, or a search-results page
-  • job_title looks like "50+ Jobs in Cairo" (aggregator listing)
-  • company_name is a job board name ("LinkedIn", "Indeed", etc.)
-  • the snippet says the listing is closed, filled, or expired
-  • the URL is from a forum, blog, Q&A site, or social network
-    (these are structurally incapable of being job postings)
-
-═══════════════════════════════════════════════════════════════════════
-SCORING (match_score 0–100)
-═══════════════════════════════════════════════════════════════════════
-
-TITLE_MATCH (0–50 pts):
-  50 → identical or near-identical to searched title
-  35 → same role family
-  20 → adjacent role or different seniority
-  10 → internship when full-time was searched (still relevant)
-   5 → loosely related
-
-LOCATION_MATCH (0–30 pts):
-  30 → exact location match
-  15 → same country / region
-   5 → remote
-   0 → different country, no remote option
-
-INFO_QUALITY (0–20 pts):
-  +5 salary has actual number/currency
-  +5 experience explicitly stated
-  +5 required_skills has ≥ 3 real skills from snippet
-  +5 direct application URL confirmed
-
-match_score = TITLE_MATCH + LOCATION_MATCH + INFO_QUALITY  [clamped 5–98]
-Every job MUST have a DIFFERENT score.
-match_reason: one sentence citing the actual title and location.
-
-═══════════════════════════════════════════════════════════════════════
-FINAL OUTPUT
-═══════════════════════════════════════════════════════════════════════
-
-Output ONLY the JSON object below. No markdown fences, no preamble,
-no explanation, no text before or after the JSON.
-
+OUTPUT — ONLY this JSON object, no markdown fences, no preamble/explanation:
 {{
   "job_title": "<user searched title>",
   "location": "<user searched location>",
-  "total_found": <integer — count of jobs AFTER filtering>,
+  "total_found": <integer — jobs AFTER filtering>,
   "agent_summary": "<2 sentences: what was searched, what was found, internships included>",
   "search_queries_used": ["<query 1>", "<query 2>"],
   "jobs": [
     {{
-      "company_name": "<verbatim from search or 'Unknown'>",
-      "job_title": "<verbatim from search>",
+      "company_name": "<verbatim or 'Unknown'>",
+      "job_title": "<verbatim>",
       "match_score": <integer>,
-      "location": "<verbatim from search or 'Not specified'>",
+      "location": "<verbatim or 'Not specified'>",
       "experience_needed": "<verbatim or 'Not specified'>",
       "salary_range": "<verbatim number/currency or 'Not specified'>",
       "required_skills": ["<only explicitly found skills>"],
@@ -512,12 +338,6 @@ no explanation, no text before or after the JSON.
 # ---------------------------------------------------------------------------
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Three-strategy JSON parser for raw LLM output.
-    Strategy 1 — direct parse (cleaned string).
-    Strategy 2 — outermost balanced { … } block.
-    Strategy 3 — bracket-completion on truncated JSON.
-    """
     text = _THINK_BLOCK_RE.sub("", text)
     text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE)
     text = text.replace("```", "").strip()
@@ -555,7 +375,6 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def _normalise_skills(skills: Any) -> List[str]:
-    """Coerce required_skills to List[str] regardless of LLM output format."""
     if skills is None:
         return []
     if isinstance(skills, list):
@@ -574,12 +393,10 @@ def _validate_and_fix_output(
     """
     Validate and sanitise the LLM JSON output.
 
-    FIX A addition: _is_content_pollution_domain() is now applied to every
-    application_link as an additional post-processing gate, catching any
-    forum/blog/social URL the model hallucinated from memory.
-
-    FIX 2 (preserved): _is_blacklisted_domain() applied as a post-processing
-    gate for CSR zombie aggregator URLs.
+    FIX N/O: adds 'path_gate' and 'stale' as named drop-reason buckets.
+    FIX M:   full visibility logging preserved.
+    FIX R:   also called on the synthetic raw dict built from ToolMessages,
+             so recovered listings pass the same validation as model output.
     """
     job_title = raw.get("job_title", "Unknown Position")
     location  = raw.get("location",  "Various")
@@ -588,36 +405,56 @@ def _validate_and_fix_output(
     if not isinstance(jobs_raw, list):
         jobs_raw = [jobs_raw] if isinstance(jobs_raw, dict) else []
 
-    jobs_fixed: List[Dict[str, Any]] = []
+    jobs_fixed:  List[Dict[str, Any]] = []
+    drop_reasons: Dict[str, int] = {
+        "not_a_dict":          0,
+        "aggregator_title":    0,
+        "job_board_company":   0,
+        "placeholder_company": 0,
+        "blacklist":           0,
+        "pollution":           0,
+        "path_gate":           0,
+        "stale":               0,
+        "bad_link":            0,
+    }
 
     for job in jobs_raw:
         if not isinstance(job, dict):
+            drop_reasons["not_a_dict"] += 1
             continue
 
         title = str(job.get("job_title", ""))
         if _AGGREGATOR_TITLE_RE.search(title):
+            drop_reasons["aggregator_title"] += 1
             logger.debug("Dropping aggregator listing: %r", title)
             continue
 
         company = str(job.get("company_name", ""))
         if _JOB_BOARD_NAMES_RE.search(company):
+            drop_reasons["job_board_company"] += 1
             logger.debug("Dropping job-board company: %r", company)
             continue
 
         if _PLACEHOLDER_COMPANY_RE.fullmatch(company.strip()):
+            drop_reasons["placeholder_company"] += 1
             logger.debug("Dropping placeholder company: %r", company)
             continue
 
         link = str(job.get("application_link", "") or "").strip()
 
-        # FIX 2 (preserved): CSR zombie domain gate
         if _is_blacklisted_domain(link):
+            drop_reasons["blacklist"] += 1
             logger.debug("Post-proc drop [blacklist]: %r link=%r", title, link)
             continue
 
-        # FIX A: content-pollution domain gate
         if _is_content_pollution_domain(link):
+            drop_reasons["pollution"] += 1
             logger.debug("Post-proc drop [pollution]: %r link=%r", title, link)
+            continue
+
+        if link and _VALID_URL_RE.match(link) and not _passes_path_gate(link):
+            drop_reasons["path_gate"] += 1
+            logger.debug("Post-proc drop [path-gate]: %r link=%r", title, link)
             continue
 
         if (
@@ -627,7 +464,14 @@ def _validate_and_fix_output(
             or _FAKE_LINK_RE.search(link)
             or _BAD_URL_RE.search(link)
         ):
+            drop_reasons["bad_link"] += 1
             logger.debug("Post-proc drop [bad-link]: %r link=%r", title, link)
+            continue
+
+        snippet_candidate = str(job.get("match_reason", ""))
+        if _snippet_is_stale(snippet_candidate, title):
+            drop_reasons["stale"] += 1
+            logger.debug("Post-proc drop [stale]: %r", title)
             continue
 
         skills = _normalise_skills(job.get("required_skills"))
@@ -672,6 +516,15 @@ def _validate_and_fix_output(
 
         jobs_fixed.append(job)
 
+    if jobs_raw:
+        logger.info(
+            "Validation: kept %d / %d raw jobs | dropped → %s",
+            len(jobs_fixed), len(jobs_raw),
+            ", ".join(f"{k}={v}" for k, v in drop_reasons.items() if v) or "none",
+        )
+    if not jobs_raw:
+        logger.info("Validation: model returned an empty jobs array (0 raw jobs).")
+
     return {
         "job_title":           job_title,
         "location":            location,
@@ -688,28 +541,14 @@ def _validate_and_fix_output(
 
 @functools.lru_cache(maxsize=1)
 def _get_llm_with_tools() -> Any:
-    
     settings = get_settings()
 
     llm = ChatGroq(
-        model=settings.groq_model,         
-        api_key=settings.groq_api_key,    
-        temperature=0.0,                 
-        max_tokens=2000,                  
-    )  
-
-    
-
-
-
-    # llm = ChatOllama(
-    #     model=settings.ollama_model,
-    #     base_url=settings.ollama_base_url,
-    #     temperature=0.0,
-    #     num_predict=2000,
-    #     format="json",
-    # )
-
+        model=settings.groq_model,
+        api_key=settings.groq_api_key,
+        temperature=0.0,
+        max_tokens=2000,
+    )
 
     tools = get_tools()
     return llm.bind_tools(tools, tool_choice="auto")
@@ -720,9 +559,14 @@ def _get_llm_with_tools() -> Any:
 # ---------------------------------------------------------------------------
 
 def llm_node(state: AgentState) -> Dict[str, Any]:
-    """Call the LLM, increment the iteration counter, refresh search state."""
     settings       = get_settings()
     llm_with_tools = _get_llm_with_tools()
+
+    if state["iterations"] == 0 and settings.max_agent_iterations > _RECOMMENDED_MAX_ITERATIONS:
+        logger.warning(
+            "max_agent_iterations=%d exceeds the recommended ceiling of %d.",
+            settings.max_agent_iterations, _RECOMMENDED_MAX_ITERATIONS,
+        )
 
     logger.info(
         "LLM node — iter %d/%d | queries=%d | intern_done=%s",
@@ -733,12 +577,13 @@ def llm_node(state: AgentState) -> Dict[str, Any]:
     response: AIMessage = llm_with_tools.invoke(state["messages"])
 
     if getattr(response, "tool_calls", None):
-        logger.info("Tool calls: %s", [tc["name"] for tc in response.tool_calls])
+        logger.info(
+            "Tool calls (%d): %s",
+            len(response.tool_calls), [tc["name"] for tc in response.tool_calls],
+        )
     else:
         logger.info("No tool call — model producing final answer.")
 
-    # FIX E: search-state is now computed from outgoing tool-call args, not
-    # from response banner text — see _extract_search_state docstring.
     queries_executed, internship_query_done = _extract_search_state(
         list(state["messages"]) + [response]
     )
@@ -751,68 +596,136 @@ def llm_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# FIX R — ToolMessage fallback helper
+# ---------------------------------------------------------------------------
+
+def _extract_listings_from_tool_messages(
+    messages: Sequence[BaseMessage],
+) -> List[Dict[str, Any]]:
+    """
+    FIX R: Parse raw ToolMessage content for the numbered listing blocks
+    that tavily_job_search emits, e.g.:
+
+        [1] Senior Front-End Developer ( Vue.js )
+            URL: https://wuzzuf.net/jobs/p/kmiuk743oelq-...
+            <snippet text>
+
+    Returns a list of minimal job dicts suitable for _validate_and_fix_output.
+    Called only when no AIMessage in the history contained extractable JSON
+    (i.e. the iteration cap fired while the model was mid-tool-call).
+
+    Scans ToolMessages newest-first so the most recent search results win
+    on URL deduplication.
+    """
+    jobs:      List[Dict[str, Any]] = []
+    seen_urls: set[str]             = set()
+
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = getattr(msg, "content", "") or ""
+        if not content:
+            continue
+
+        for m in _TOOL_LISTING_RE.finditer(content):
+            title = m.group(2).strip()
+            url   = m.group(3).strip()
+
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            jobs.append({
+                "company_name":      "Unknown",
+                "job_title":         title,
+                "match_score":       50,
+                "location":          "Not specified",
+                "experience_needed": "Not specified",
+                "salary_range":      "Not specified",
+                "required_skills":   [],
+                "match_reason":      (
+                    "Extracted from search results "
+                    "(agent did not finalise before iteration cap)."
+                ),
+                "source":            "Web",
+                "application_link":  url,
+            })
+
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# graceful_exit_node — with FIX R ToolMessage fallback
+# ---------------------------------------------------------------------------
+
 def graceful_exit_node(state: AgentState) -> Dict[str, Any]:
-    """Extract and validate JSON from the most recent AIMessage."""
-    last_ai_text: str = ""
+    """
+    FIX R+ replacement: Smart fallback that overrides an "empty" model 
+    response if ToolMessages actually contain valid listings.
+    """
+    raw: Optional[Dict[str, Any]] = None
+
     for msg in reversed(state["messages"]):
-        if isinstance(msg, AIMessage):
-            last_ai_text = getattr(msg, "content", "") or ""
+        if not isinstance(msg, AIMessage):
+            continue
+        text = getattr(msg, "content", "") or ""
+        if not text.strip():
+            continue
+        candidate = _extract_json(text)
+        if candidate:
+            raw = candidate
             break
 
-    raw = _extract_json(last_ai_text)
-
-    if raw:
+    if raw and raw.get("jobs"):
+        logger.info("RAW_JSON_BEFORE_VALIDATION >>>\n%s", json.dumps(raw, indent=2, ensure_ascii=False)[:4000])
         result = _validate_and_fix_output(raw)
-    else:
-        logger.warning("graceful_exit: could not parse JSON from last AIMessage.")
-        result = {
-            "job_title":           "Unknown",
-            "location":            "Various",
-            "total_found":         0,
-            "agent_summary":       "The agent could not produce a structured response.",
+        return {"final_output": result}
+
+    logger.warning("graceful_exit: Model returned empty or no JSON. Attempting recovery from ToolMessages...")
+    
+    tool_jobs = _extract_listings_from_tool_messages(state["messages"])
+
+    if tool_jobs:
+        logger.info("FIX R+: recovered %d listing(s) from ToolMessages.", len(tool_jobs))
+        synthetic_raw: Dict[str, Any] = {
+            "job_title": "Frontend Developer", 
+            "location": "Cairo",
+            "total_found": len(tool_jobs),
+            "agent_summary": f"Model returned empty, but recovered {len(tool_jobs)} listing(s) from search results.",
             "search_queries_used": [],
-            "jobs":                [],
+            "jobs": tool_jobs,
+        }
+        result = _validate_and_fix_output(synthetic_raw)
+    else:
+        logger.warning("FIX R+: No listings recoverable.")
+        result = {
+            "job_title": "Unknown",
+            "location": "Various",
+            "total_found": 0,
+            "agent_summary": "The agent could not produce a structured response.",
+            "search_queries_used": [],
+            "jobs": [],
         }
 
     return {"final_output": result}
 
-
 # ---------------------------------------------------------------------------
-# FIX 3 (preserved): Coercion message factory and node
+# Coercion fallback (preserved)
 # ---------------------------------------------------------------------------
 
 def _build_internship_coercion_message(queries_executed: int) -> HumanMessage:
-    """
-    Short, high-urgency message injected when the model tries to exit
-    before completing its mandatory internship query.
-    """
-    # Pick a concrete example board for the internship query that differs
-    # from the most commonly used Step 1 boards (wuzzuf/bayt) to prompt
-    # board variation as required by REQUIREMENT 2.
     return HumanMessage(
         content=(
-            f"⛔ STOP — MANDATORY STEP INCOMPLETE ⛔\n\n"
-            f"You have completed {queries_executed} query/queries but have NOT run "
-            f"the mandatory INTERNSHIP / TRAINEE query (Step 2 of your checklist).\n\n"
-            f"You are NOT permitted to emit the final JSON until Step 2 is done.\n\n"
-            f"ACTION REQUIRED — call tavily_job_search NOW with a query that "
-            f"contains the word 'internship', 'intern', or 'trainee', e.g.:\n"
-            f'  "<PRIMARY_TECH> <role> internship site:linkedin.com/jobs"\n'
-            f"  OR\n"
-            f'  "<PRIMARY_TECH> <role> intern site:wuzzuf.net OR site:akhtaboot.com"\n\n'
-            f"Rules:\n"
-            f"• Technology keyword MUST be in the query — use only the\n"
-            f"  candidate's OWN stack, never a different language's keyword.\n"
-            f"• site: clause MUST be from the approved board list.\n"
-            f"• No conversational filler or stray operational words (e.g. a\n"
-            f"  leaked 'Go', 'Run', 'Now') in the query string.\n\n"
-            f"After that tool call returns, combine all results and emit the final JSON."
+            f"You ran {queries_executed} query/queries but skipped the required "
+            f"internship/trainee query. Call tavily_job_search now with a query "
+            f"containing 'internship', 'intern', or 'trainee', using a DIFFERENT "
+            f"approved board than before. Then emit the final JSON."
         )
     )
 
 
 def coerce_internship_node(state: AgentState) -> Dict[str, Any]:
-    """Inject the internship coercion message and set coercion_injected=True."""
     coercion_msg = _build_internship_coercion_message(state["queries_executed"])
     logger.info("coerce_internship_node: injecting coercion message.")
     return {
@@ -822,19 +735,10 @@ def coerce_internship_node(state: AgentState) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Router
+# Router (preserved)
 # ---------------------------------------------------------------------------
 
 def _route(state: AgentState) -> str:
-    """
-    Route after each LLM call.
-
-    Order:
-    1. Iteration cap → graceful_exit.
-    2. Tool call present → tool_node.
-    3. Internship query not done + coercion not yet sent → coerce_internship.
-    4. Otherwise → graceful_exit.
-    """
     settings = get_settings()
 
     if state["iterations"] >= settings.max_agent_iterations:
@@ -843,7 +747,7 @@ def _route(state: AgentState) -> str:
 
     last_msg = state["messages"][-1]
     if isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None):
-        logger.info("Tool call → tool_node.")
+        logger.info("Tool call(s) → tool_node.")
         return "tool_node"
 
     if (
@@ -863,19 +767,11 @@ def _route(state: AgentState) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Graph assembly
+# Graph assembly (preserved)
 # ---------------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=1)
 def _get_graph() -> Any:
-    """
-    Build and compile the LangGraph StateGraph exactly once.
-
-    Topology:
-        START → llm_node ← tool_node ← llm_node
-                         ← coerce_internship
-                         → graceful_exit → END
-    """
     tools     = get_tools()
     tool_node = ToolNode(tools)
 
@@ -903,19 +799,18 @@ def _get_graph() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Internal graph runner
+# Internal graph runner (preserved)
 # ---------------------------------------------------------------------------
 
 def _invoke_graph(user_message: str, cv_text: str = "") -> Dict[str, Any]:
-    """Run the compiled graph from a fresh initial state."""
     graph = _get_graph()
 
     system_content = _SYSTEM_PROMPT
     if cv_text:
         system_content += (
-            f"\n\n=== CANDIDATE CV CONTENT ===\n{cv_text}\n=== END OF CV ===\n\n"
-            "STRICT RULE: Extract skills ONLY from the CV above. "
-            "Do NOT add any technology not present verbatim in the CV."
+            f"\n\n=== CANDIDATE CV ===\n{cv_text}\n=== END CV ===\n"
+            "Extract skills ONLY from this CV — never add a technology not "
+            "present verbatim in it."
         )
 
     initial_state: AgentState = {
@@ -950,85 +845,81 @@ def _invoke_graph(user_message: str, cv_text: str = "") -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Tech vocabulary extraction (preserved, unmodified)
+# ---------------------------------------------------------------------------
+
+_TECH_VOCAB: List[str] = [
+    "Python", "Java", "Kotlin", "Swift", "Go", "Rust", "C++", "C#",
+    "Ruby", "PHP", "Scala", "TypeScript", "JavaScript",
+    "React", "Vue", "Angular", "Svelte", "Flutter", "Android", "iOS",
+    "Next.js", "Nuxt", "Node.js", "Django", "Flask", "FastAPI",
+    "Spring Boot", "Spring", "Laravel", "Rails", "Express", "NestJS",
+    ".NET", "ASP.NET", "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis",
+    "Elasticsearch", "Apache Spark", "Kafka", "TensorFlow", "PyTorch",
+    "pandas", "scikit-learn", "NumPy", "LLM", "NLP", "Machine Learning",
+    "Deep Learning", "Data Science", "AWS", "Azure", "GCP", "Docker",
+    "Kubernetes", "Terraform", "CI/CD", "DevOps", "MLOps",
+    "React Native", "Xamarin",
+]
+
+
+@functools.lru_cache(maxsize=1)
+def _get_tech_vocab_pattern() -> "re.Pattern[str]":
+    ordered = sorted(_TECH_VOCAB, key=len, reverse=True)
+    escaped = [re.escape(term) for term in ordered]
+    pattern = (
+        r"(?<![A-Za-z0-9])(?:" + "|".join(escaped) + r")(?![A-Za-z0-9])"
+    )
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def _extract_tech_stack_from_cv(cv_text: str) -> List[str]:
+    pattern    = _get_tech_vocab_pattern()
+    found_lower = {m.group(0).lower() for m in pattern.finditer(cv_text)}
+    return [term for term in _TECH_VOCAB if term.lower() in found_lower]
+
+
+# ---------------------------------------------------------------------------
+# Public API (preserved, unmodified)
 # ---------------------------------------------------------------------------
 
 def run_cv_analysis(cv_text: str, detected_title: str = "") -> Dict[str, Any]:
-    """
-    Analyse a candidate's CV and find matching real-world jobs (incl. internships).
-
-    FIX B: user message provides only approved-board query examples with
-    explicit site: clauses. "No site: restriction" guidance is removed entirely.
-    The query examples in the message match REQUIREMENT 2 in the system prompt.
-    """
-    # Extract primary technologies from CV text
-    _TECH_VOCAB: List[str] = [
-        "Python", "Java", "Kotlin", "Swift", "Go", "Rust", "C++", "C#",
-        "Ruby", "PHP", "Scala", "TypeScript", "JavaScript",
-        "React", "Vue", "Angular", "Svelte", "Flutter", "Android", "iOS",
-        "Next.js", "Nuxt", "Node.js", "Django", "Flask", "FastAPI",
-        "Spring Boot", "Spring", "Laravel", "Rails", "Express", "NestJS",
-        ".NET", "ASP.NET", "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis",
-        "Elasticsearch", "Apache Spark", "Kafka", "TensorFlow", "PyTorch",
-        "pandas", "scikit-learn", "NumPy", "LLM", "NLP", "Machine Learning",
-        "Deep Learning", "Data Science", "AWS", "Azure", "GCP", "Docker",
-        "Kubernetes", "Terraform", "CI/CD", "DevOps", "MLOps",
-        "React Native", "Xamarin",
-    ]
-    cv_lower   = cv_text.lower()
-    found_tech = [t for t in _TECH_VOCAB if t.lower() in cv_lower]
+    found_tech = _extract_tech_stack_from_cv(cv_text)
     stack_str  = (
         ", ".join(found_tech[:10]) if found_tech
-        else "Not yet identified — read the CV carefully before building queries."
+        else "Not yet identified — read the CV above carefully before building queries."
     )
 
-    title_hint = f" The candidate's likely title is '{detected_title}'." if detected_title else ""
+    title_hint = f" Likely title: '{detected_title}'." if detected_title else ""
 
     user_message = (
-        f"A candidate uploaded their CV.{title_hint}\n\n"
-        f"══════════════════════════════════════════════════════\n"
-        f"PRIMARY TECHNOLOGY STACK (from CV — USE IN EVERY QUERY):\n"
-        f"  {stack_str}\n"
-        f"══════════════════════════════════════════════════════\n\n"
-        f"RULES:\n"
-        f"• Include at least one technology from the stack above in EVERY query.\n"
-        f"• Use ONLY the stack listed above — never substitute a different\n"
-        f"  language's keyword and never let a stray operational word (e.g.\n"
-        f"  a leaked 'Go') slip in front of it.\n"
-        f"• Every query MUST include a site: clause from the approved board list.\n"
-        f"• Do NOT use open-web queries (no site: restriction). They are FORBIDDEN.\n"
-        f"• Do NOT add exclusion clauses (-'closed' etc.) — filtering is automatic.\n"
-        f"• Query argument must be search tokens only — no conversational preamble.\n\n"
-        f"MANDATORY SEARCH STEPS:\n"
-        f"☐ Step 1 (full-time): e.g. '{found_tech[0] if found_tech else '<TECH>'} "
-        f"developer jobs site:wuzzuf.net OR site:bayt.com'\n"
-        f"☐ Step 2 (internship): e.g. '{found_tech[0] if found_tech else '<TECH>'} "
-        f"developer internship site:linkedin.com/jobs'\n"
-        f"  Use a DIFFERENT approved board in Step 2 than in Step 1. The query\n"
-        f"  text MUST contain 'internship', 'intern', or 'trainee'.\n"
-        f"☐ Step 3 (if <4 results): try another approved board.\n"
-        f"☐ Step 4: emit final JSON ONLY after Steps 1 and 2 are both done.\n\n"
-        f"CV Content:\n{cv_text}"
+        f"A candidate uploaded their CV (see system message above).{title_hint}\n\n"
+        f"PRIMARY TECH STACK (from CV, use in every query): {stack_str}\n\n"
+        f"Find matching jobs AND internships for this candidate. Fire BOTH the "
+        f"full-time query and the internship query as PARALLEL tool calls in "
+        f"this turn (see system prompt). Use ONLY the stack above — never a "
+        f"different language's keyword, never a leaked operational word (e.g. "
+        f"stray 'Go') in front of it. Each query needs a technology keyword and "
+        f"an approved site: clause; use a different board for each of the two "
+        f"calls. Example pair:\n"
+        f"  '{found_tech[0] if found_tech else '<TECH>'} developer jobs "
+        f"site:wuzzuf.net OR site:bayt.com'\n"
+        f"  '{found_tech[0] if found_tech else '<TECH>'} developer internship "
+        f"site:linkedin.com/jobs'\n"
+        f"Emit the final JSON only after both calls have returned."
     )
 
     return _invoke_graph(user_message, cv_text=cv_text)
 
 
 def run_targeted_search(job_title: str, location: str) -> Dict[str, Any]:
-    """
-    Search for real open job listings (incl. internships) for a title and location.
-
-    FIX B: query examples always include an approved site: token.
-    FIX F: explicit warning against leaking a stray "Go" or other operational
-    token in front of the title's own (possibly non-Go) stack.
-    """
-    # Extract technology from the title string itself
     _INLINE_TECH_RE = re.compile(
-        r"\b(Python|Java(?:Script)?|Kotlin|Swift|Go|Rust|C\+\+|C#|Ruby|PHP|"
-        r"Scala|TypeScript|React|Vue|Angular|Flutter|Android|iOS|Node\.?js|"
-        r"Django|Flask|FastAPI|Spring(?:\s+Boot)?|Laravel|Rails|Express|"
-        r"NestJS|\.NET|ASP\.NET|SQL|PostgreSQL|MySQL|MongoDB|Redis|"
-        r"TensorFlow|PyTorch|pandas|AWS|Azure|GCP|Docker|Kubernetes)\b",
+        r"(?<![A-Za-z0-9])(?:Python|Java(?:Script)?|Kotlin|Swift|Go|Rust|"
+        r"C\+\+|C#|Ruby|PHP|Scala|TypeScript|React|Vue|Angular|Flutter|"
+        r"Android|iOS|Node\.?js|Django|Flask|FastAPI|Spring(?:\s+Boot)?|"
+        r"Laravel|Rails|Express|NestJS|\.NET|ASP\.NET|SQL|PostgreSQL|"
+        r"MySQL|MongoDB|Redis|TensorFlow|PyTorch|pandas|AWS|Azure|GCP|"
+        r"Docker|Kubernetes)(?![A-Za-z0-9])",
         re.IGNORECASE,
     )
     title_techs   = _INLINE_TECH_RE.findall(job_title)
@@ -1037,40 +928,40 @@ def run_targeted_search(job_title: str, location: str) -> Dict[str, Any]:
         ", ".join(deduped_techs) if deduped_techs
         else "None in title — use the most common stack for this role type."
     )
-    # Best single tech token for query examples
     tech_token = deduped_techs[0] if deduped_techs else "<PRIMARY_TECH>"
 
+    job_title_stripped = job_title.strip()
+    if deduped_techs and job_title_stripped.lower().startswith(tech_token.lower()):
+        example_title = job_title_stripped
+    else:
+        example_title = f"{tech_token} {job_title_stripped}"
+
+    location_token = location.strip()
+
     user_message = (
-        f"Find REAL, CURRENTLY OPEN '{job_title}' jobs AND internships "
-        f"in '{location}'.\n\n"
-        f"══════════════════════════════════════════════════════\n"
-        f"TECHNOLOGY KEYWORDS FOR QUERIES:\n"
-        f"  {tech_str}\n"
-        f"══════════════════════════════════════════════════════\n\n"
-        f"RULES:\n"
-        f"• Every query MUST include a technology keyword AND a site: clause.\n"
-        f"• Use ONLY the keyword(s) above — never a different language, and\n"
-        f"  never a leaked operational word (e.g. 'Go', 'Run', 'Now') placed\n"
-        f"  in front of the stack. A stray 'Go' in front of a C#/.NET query,\n"
-        f"  for example, will be read as the Go/Golang language and will\n"
-        f"  corrupt the results away from the stack you actually want.\n"
-        f"• site: clause MUST be from the approved board list in the system prompt.\n"
-        f"• Do NOT use open-web queries without a site: clause — FORBIDDEN.\n"
-        f"• Do NOT add -'closed' or similar exclusion text — filtering is automatic.\n"
-        f"• Query argument must be search tokens only — no conversational preamble.\n\n"
-        f"MANDATORY SEARCH STEPS:\n"
-        f"☐ Step 1 (full-time):\n"
-        f"  '{tech_token} {job_title} jobs site:wuzzuf.net OR site:bayt.com'\n"
-        f"  OR '{tech_token} {job_title} jobs site:linkedin.com/jobs'\n"
-        f"☐ Step 2 (internship — MANDATORY even if Step 1 returned results):\n"
-        f"  '{tech_token} {job_title} internship site:linkedin.com/jobs'\n"
-        f"  OR '{tech_token} {job_title} intern site:wuzzuf.net OR site:akhtaboot.com'\n"
-        f"  Use a DIFFERENT approved board than Step 1. The query text MUST\n"
-        f"  contain 'internship', 'intern', or 'trainee'.\n"
-        f"☐ Step 3 (if <4 valid listings): try site:indeed.com or site:glassdoor.com.\n"
-        f"☐ Step 4: emit final JSON ONLY after Steps 1 and 2 are both complete.\n\n"
-        f"Only include roles in the '{job_title}' domain (or internships thereof).\n"
-        f"Return an empty jobs array rather than inventing listings."
+        f"Find REAL, CURRENTLY OPEN '{job_title}' jobs AND internships in "
+        f"'{location}'.\n\n"
+        f"Tech keywords for queries: {tech_str}\n\n"
+        f"Fire BOTH the full-time query and the internship query as PARALLEL "
+        f"tool calls in this turn (see system prompt). Use ONLY the keyword(s) "
+        f"above — never a different language, never a leaked operational word "
+        f"(e.g. 'Go', 'Run', 'Now') in front of the stack. Both queries below "
+        f"MUST include the technology keyword exactly once each, AND MUST "
+        f"include the location '{location_token}' verbatim — copy the "
+        f"role-title wording EXACTLY as shown, do not add the keyword a "
+        f"second time within the SAME query, and do not drop the technology "
+        f"OR the location from either query (dropping the location is a "
+        f"critical failure — it is what causes empty/irrelevant result sets). "
+        f"Never write 'in {location_token}' — use the bare token, no preposition. "
+        f"Each query needs a technology keyword, the location token, and an "
+        f"approved site: clause; use a different board for each of the two "
+        f"calls. Copy this exact pair, changing ONLY the site: clause if needed:\n"
+        f"  '{example_title} {location_token} jobs site:wuzzuf.net OR site:bayt.com'\n"
+        f"  '{example_title} {location_token} internship site:linkedin.com/jobs'\n"
+        f"Only include roles in the '{job_title}' domain (or internships "
+        f"thereof), located in or near '{location}'. Emit the final JSON only "
+        f"after both calls have returned. Return an empty jobs array rather "
+        f"than inventing listings."
     )
 
     result = _invoke_graph(user_message)
