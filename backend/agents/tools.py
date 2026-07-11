@@ -156,13 +156,24 @@ _LIVE_PROBE_MAX_WORKERS: int = 4
 # Recency configuration
 # ---------------------------------------------------------------------------
 
-RECENCY_WINDOW_DAYS: int = 20
+# Absolute crawl-date cutoff (YYYY-MM-DD) handed to Tavily's `start_date`.
+# 30 days == "posted within the past month". Kept in lock-step with the
+# relative `time_range` window (settings.tavily_time_range, default "month")
+# so the two freshness filters reinforce rather than contradict each other.
+RECENCY_WINDOW_DAYS: int = 30
 
 
 def _compute_recency_cutoff(days_back: int = RECENCY_WINDOW_DAYS) -> str:
     """Return today's date minus ``days_back`` days as YYYY-MM-DD."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
     return cutoff.strftime("%Y-%m-%d")
+
+
+def _current_year() -> int:
+    """Current UTC year — injected into every query as a recency signal so
+    the search engine biases toward freshly-posted listings and away from
+    multi-year-old archived pages that share the same URL structure."""
+    return datetime.now(timezone.utc).year
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +342,20 @@ _BOARD_PATH_PATTERNS: Dict[str, re.Pattern] = {
     # Dice: /jobs/detail/<slug>
     "dice.com": re.compile(
         r"^/jobs/detail/[^/]+",
+        re.IGNORECASE,
+    ),
+    # Greenhouse: individual listings live at /<company>/jobs/<numeric-id>
+    # across boards.greenhouse.io and job-boards.greenhouse.io. A bare
+    # /<company> path is the company's board hub, not a vacancy.
+    "greenhouse.io": re.compile(
+        r"^/[^/]+/jobs/\d+",
+        re.IGNORECASE,
+    ),
+    # Lever: individual listings are /<company>/<posting-id>. A bare
+    # /<company> path is the company's list page; a two-segment path is a
+    # discrete posting (optionally followed by /apply).
+    "lever.co": re.compile(
+        r"^/[^/]+/[^/]+",
         re.IGNORECASE,
     ),
 }
@@ -553,6 +578,12 @@ APPROVED_SEARCH_BOARDS: dict[str, str] = {
     "himalayas":      "site:himalayas.app",
     "wellfound":      "site:wellfound.com",
     "dice":           "site:dice.com",
+    # Direct-ATS boards — the freshest source available: postings are served
+    # straight from the hiring company's applicant-tracking system and are
+    # taken down the moment a role is filled/closed, so zombie/expired
+    # listings are structurally rare here versus scraped aggregators.
+    "greenhouse":     "site:greenhouse.io",
+    "lever":          "site:jobs.lever.co",
 }
 
 APPROVED_SITE_TOKENS: List[str] = list(APPROVED_SEARCH_BOARDS.values())
@@ -1103,6 +1134,9 @@ def tavily_job_search(query: str) -> str:
                              site:himalayas.app
         Tech-specialist    : site:wellfound.com
                              site:dice.com
+        Direct ATS (freshest — prefer when possible):
+                             site:greenhouse.io
+                             site:jobs.lever.co
 
       You MAY combine up to two approved boards using OR in one query.
       You may NOT use any domain not on the list above.
@@ -1127,7 +1161,13 @@ def tavily_job_search(query: str) -> str:
 
     RULE 5 — NEVER INVENT RESULTS. Copy URLs character-for-character.
 
-    RULE 6 — RECENCY IS AUTOMATIC. Do NOT add a specific year.
+    RULE 6 — RECENCY: the tool automatically restricts results to the past
+      month (Tavily start_date + time_range) AND appends the current year plus
+      "hiring now" / "actively hiring" recency tokens to every query, so you
+      do not need to add a year yourself — but you MAY append "hiring now" or
+      the current year to a query and it will not be penalised. Never add a
+      year OLDER than the current one (that reintroduces the archived-listing
+      problem this filter exists to solve).
 
     Returns a numbered list of job postings from approved boards only.
     Category/listing pages, templates, blog articles, career-advice pages,
@@ -1183,16 +1223,28 @@ def tavily_job_search(query: str) -> str:
 
     exclude_domains = _build_tavily_exclude_domains()
     recency_cutoff  = _compute_recency_cutoff()
+    time_range      = settings.tavily_time_range
+    current_year    = _current_year()
 
+    # STRICT TIME FILTERING (query layer): append explicit recency tokens so
+    # the search engine biases toward freshly-posted roles. The current year
+    # plus "hiring now"/"actively hiring" pull active listings to the top and
+    # push multi-year-old archived pages down/out, complementing the
+    # start_date + time_range crawl-date filters applied on the API call.
     enriched_query = (
-        f'{clean_query} ("apply now" OR "hiring now" OR "job description") '
+        f'{clean_query} '
+        f'("hiring now" OR "actively hiring" OR "apply now" OR "{current_year}") '
         f'-"jobs in" -"browse jobs" -"vacancies in"'
     )
 
+    # NOTE: Tavily rejects start_date/end_date and time_range together
+    # ("When time_range is set, start_date or end_date cannot be set"), so we
+    # pass ONLY time_range as the crawl-date filter. recency_cutoff is retained
+    # purely for the human-readable "posted within the past ~N days" note.
     logger.info(
-        "Tavily search | query: %r | start_date: %s | max_results: %d | "
-        "exclude_domains count: %d",
-        enriched_query, recency_cutoff,
+        "Tavily search | query: %r | time_range: %s (~since %s) | "
+        "max_results: %d | exclude_domains count: %d",
+        enriched_query, time_range, recency_cutoff,
         settings.tavily_max_results, len(exclude_domains),
     )
 
@@ -1201,7 +1253,7 @@ def tavily_job_search(query: str) -> str:
             query=enriched_query,
             search_depth="advanced",
             max_results=settings.tavily_max_results,
-            start_date=recency_cutoff,
+            time_range=time_range,
             exclude_domains=exclude_domains,
             include_answer=False,
             include_raw_content=False,
@@ -1213,7 +1265,7 @@ def tavily_job_search(query: str) -> str:
                 query=clean_query,
                 search_depth="basic",
                 max_results=settings.tavily_max_results,
-                start_date=recency_cutoff,
+                time_range=time_range,
                 exclude_domains=exclude_domains,
                 include_answer=False,
                 include_raw_content=False,
