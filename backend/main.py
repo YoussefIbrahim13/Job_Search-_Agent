@@ -11,6 +11,15 @@ from backend.core.config import get_settings
 from .api.routes import router
 
 
+# Force UTF-8 on the log stream so emoji/Unicode in log messages (🤖, ✅, →,
+# Arabic snippet text, etc.) don't raise UnicodeEncodeError under the Windows
+# console's legacy cp1252 codec. reconfigure() exists on Py3.7+ TextIO streams;
+# guard it so a non-standard stdout (pytest capture, etc.) can't break startup.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",

@@ -44,6 +44,7 @@ import functools
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Annotated, Any, Dict, List, Optional, Sequence, TypedDict
 
 from langchain_core.messages import (
@@ -134,6 +135,10 @@ _TOOL_LISTING_RE = re.compile(
 _TAVILY_TOOL_NAME            = "tavily_job_search"
 _RECOMMENDED_MAX_ITERATIONS  = 3
 
+# Current year — injected into the system prompt so the model's recency
+# instructions never hard-code a stale year across calendar boundaries.
+_CURRENT_YEAR = datetime.now(timezone.utc).year
+
 
 # ---------------------------------------------------------------------------
 # Agent State
@@ -193,12 +198,14 @@ def _build_approved_boards_prompt_block() -> str:
     mena_boards    = ["wuzzuf", "bayt", "akhtaboot"]
     remote_boards  = ["weworkremotely", "remoteok", "himalayas"]
     tech_boards    = ["wellfound", "dice"]
+    ats_boards     = ["greenhouse", "lever"]
 
     groups = [
-        ("Global",    global_boards),
-        ("MENA/Gulf", mena_boards),
-        ("Remote",    remote_boards),
-        ("Tech",      tech_boards),
+        ("Global",                 global_boards),
+        ("MENA/Gulf",              mena_boards),
+        ("Remote",                 remote_boards),
+        ("Tech",                   tech_boards),
+        ("Direct ATS (freshest)",  ats_boards),
     ]
     lines = []
     for label, keys in groups:
@@ -257,6 +264,14 @@ QUERY RULES for tavily_job_search:
    ✓ "C# ASP.NET backend developer Remote internship site:linkedin.com/jobs"
    ✗ "Go ASP.NET backend developer Cairo jobs site:linkedin.com/jobs" (leaked "Go")
    ✗ "C# ASP.NET backend developer internship site:linkedin.com/jobs" (no location)
+5. RECENCY: you are looking for CURRENTLY OPEN roles only ({_CURRENT_YEAR}).
+   The tool already restricts results to the past month and appends the
+   current year automatically, so you never need a year in the query — but
+   you MUST prioritise ACTIVE job boards over archived/static content. Prefer
+   direct-ATS boards (site:greenhouse.io, site:jobs.lever.co) and live
+   aggregators (LinkedIn, Indeed, Wuzzuf) — these de-list filled roles. Never
+   target blog posts, "best jobs of <old year>" round-ups, or career-advice
+   articles; those are archived pages, not vacancies, and are rejected anyway.
 
 PARALLEL EXECUTION — DO THIS IN YOUR FIRST TURN:
 Call tavily_job_search TWICE IN THE SAME TURN: one full-time/senior query,
