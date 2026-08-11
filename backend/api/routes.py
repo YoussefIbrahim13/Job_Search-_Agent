@@ -33,16 +33,37 @@ import asyncio
 import logging
 import re
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from backend.agents.recruitment_agent import run_cv_analysis, run_targeted_search
+from backend.core.config import get_settings
 from backend.parsers.cv_parser import parse_cv_bytes
+from backend.services import job_search as structured_search
+from backend.sources.schema import Seniority
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _to_seniority(value: Optional[str]) -> Optional[Seniority]:
+    """
+    Map the CV parser's seniority label onto the schema enum.
+
+    Returns None on anything unrecognised. The vocabularies are meant to match
+    exactly (there is a test pinning that), but a CV upload must not 500
+    because the parser grew a keyword the schema does not model yet.
+    """
+    if not value:
+        return None
+    try:
+        return Seniority(value)
+    except ValueError:
+        logger.debug("Unmapped seniority label from CV parser: %r", value)
+        return None
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -290,14 +311,25 @@ async def targeted_search_endpoint(request: SearchRequest):
     Ollama call cannot starve other in-flight requests indefinitely.
     """
     try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                run_targeted_search,
-                request.job_title,
-                request.location,
-            ),
-            timeout=AGENT_TIMEOUT_SECONDS,
-        )
+        if get_settings().use_structured_pipeline:
+            # Natively async: the registry fans out with asyncio.gather, so
+            # there is no blocking call to push into a thread. The timeout
+            # still applies as a ceiling on the whole pipeline.
+            result = await asyncio.wait_for(
+                structured_search.run_targeted_search(
+                    request.job_title, request.location
+                ),
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
+        else:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_targeted_search,
+                    request.job_title,
+                    request.location,
+                ),
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
     except asyncio.TimeoutError:
         logger.error(
             "Targeted search timed out after %ds for job_title=%r location=%r",
@@ -417,15 +449,31 @@ async def analyze_cv_endpoint(
     # to the response afterwards, so the agent searched with no location at all
     # and the response then reported a location that was never used.
     try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                run_cv_analysis,
-                profile.raw_text,
-                profile.detected_title,
-                preferred_location.strip(),
-            ),
-            timeout=AGENT_TIMEOUT_SECONDS,
-        )
+        if get_settings().use_structured_pipeline:
+            # The already-parsed profile fields are handed straight through
+            # rather than re-derived from the text: parsing the same upload
+            # twice risks two different answers for one CV.
+            result = await asyncio.wait_for(
+                structured_search.run_cv_analysis(
+                    profile.raw_text,
+                    profile.detected_title,
+                    preferred_location.strip(),
+                    skills=profile.skills,
+                    seniority=_to_seniority(profile.seniority),
+                    years_experience=profile.years_experience,
+                ),
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
+        else:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_cv_analysis,
+                    profile.raw_text,
+                    profile.detected_title,
+                    preferred_location.strip(),
+                ),
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
     except asyncio.TimeoutError:
         logger.error(
             "CV analysis timed out after %ds for file %r",

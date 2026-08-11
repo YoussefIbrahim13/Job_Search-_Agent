@@ -1,0 +1,77 @@
+{
+  "_meta": {
+    "origin": "synthetic",
+    "why": "Exercises the free-text salary parser (range, hourly, and unparseable), HTML description stripping, job_type mapping, and the records that must be skipped. Salary here is prose, unlike JSearch's numeric fields — that difference is the point of adding this provider to the test set.",
+    "shape_note": "Envelope and field names follow the public Remotive API (remotive.com/api/remote-jobs)."
+  },
+  "0-legal-notice": "Remotive API legal notice placeholder.",
+  "job-count": 5,
+  "jobs": [
+    {
+      "id": 1902345,
+      "url": "https://remotive.com/remote-jobs/software-dev/senior-backend-engineer-1902345",
+      "title": "Senior Backend Engineer",
+      "company_name": "Buffer",
+      "company_logo": "https://example.com/buffer.png",
+      "category": "Software Development",
+      "tags": ["python", "django", "postgresql", "aws"],
+      "job_type": "full_time",
+      "publication_date": "2026-08-06T10:15:00",
+      "candidate_required_location": "Worldwide",
+      "salary": "$120,000 - $150,000",
+      "description": "<p>We are looking for a <b>Senior Backend Engineer</b>.</p><ul><li>Python and Django</li><li>PostgreSQL</li><li>Docker &amp; AWS</li></ul>"
+    },
+    {
+      "id": 1902346,
+      "url": "https://remotive.com/remote-jobs/software-dev/python-contractor-1902346",
+      "title": "Python Contractor",
+      "company_name": "Toptal",
+      "category": "Software Development",
+      "tags": ["python", "fastapi"],
+      "job_type": "contract",
+      "publication_date": "2026-08-08T08:00:00",
+      "candidate_required_location": "Europe",
+      "salary": "$60 - $85 per hour",
+      "description": "<p>Contract role building APIs with Python and FastAPI.</p>"
+    },
+    {
+      "id": 1902347,
+      "url": "https://remotive.com/remote-jobs/software-dev/backend-intern-1902347",
+      "title": "Backend Development Intern",
+      "company_name": "Zapier",
+      "category": "Software Development",
+      "tags": ["python"],
+      "job_type": "internship",
+      "publication_date": "2026-08-09T12:00:00",
+      "candidate_required_location": "USA Only",
+      "salary": "",
+      "description": "<p>Internship working with Python. No experience required.</p>"
+    },
+    {
+      "id": 1902348,
+      "url": "https://remotive.com/remote-jobs/software-dev/vague-pay-1902348",
+      "title": "Lead Platform Engineer",
+      "company_name": "Doist",
+      "category": "Software Development",
+      "tags": ["kubernetes", "go"],
+      "job_type": "full_time",
+      "publication_date": "2026-08-04T09:00:00",
+      "candidate_required_location": "Worldwide",
+      "salary": "Competitive salary based on experience",
+      "description": "<p>Lead our platform team. Kubernetes and Go.</p>"
+    },
+    {
+      "id": 1902349,
+      "url": null,
+      "title": "Broken Listing",
+      "company_name": "NoURL Inc",
+      "category": "Software Development",
+      "tags": [],
+      "job_type": "full_time",
+      "publication_date": "2026-08-04T09:00:00",
+      "candidate_required_location": "Worldwide",
+      "salary": "",
+      "description": "<p>This record has no URL and must be skipped.</p>"
+    }
+  ]
+}

@@ -1,0 +1,129 @@
+{
+  "_meta": {
+    "origin": "synthetic",
+    "why": "Covers the mapping cases that are easy to get wrong and invisible when wrong: monthly-vs-yearly salary period, zero-as-unspecified salary, both employment-type spellings, job_is_remote=false meaning 'unknown' rather than 'onsite', and records that must be skipped without failing the batch.",
+    "shape_note": "Envelope and field names follow JSearch v1 (RapidAPI). Replace with a real capture when a key is available; the adapter tests read this file, not the network."
+  },
+  "status": "OK",
+  "request_id": "synthetic-fixture-0001",
+  "parameters": {
+    "query": "Backend Engineer in Cairo",
+    "page": 1,
+    "num_pages": 1
+  },
+  "data": [
+    {
+      "job_id": "eyJqb2JfaWQiOiJjYWlyby0wMDEifQ==",
+      "employer_name": "Sylndr",
+      "employer_logo": "https://example.com/logo.png",
+      "job_publisher": "Wuzzuf",
+      "job_employment_type": "FULLTIME",
+      "job_title": "Senior Backend Engineer",
+      "job_apply_link": "https://wuzzuf.net/jobs/p/842119-Senior-Backend-Engineer-Cairo",
+      "job_description": "We are hiring a Senior Backend Engineer in Cairo. You will work with Python, Django, PostgreSQL and Docker to build our core platform. 5+ years experience required.",
+      "job_is_remote": false,
+      "job_posted_at_datetime_utc": "2026-08-05T09:30:00.000Z",
+      "job_city": "Cairo",
+      "job_state": "Cairo Governorate",
+      "job_country": "EG",
+      "job_min_salary": 40000,
+      "job_max_salary": 60000,
+      "job_salary_currency": "EGP",
+      "job_salary_period": "MONTH",
+      "job_required_experience": {
+        "no_experience_required": false,
+        "required_experience_in_months": 60,
+        "experience_mentioned": true,
+        "experience_preferred": false
+      },
+      "job_required_skills": null
+    },
+    {
+      "job_id": "eyJqb2JfaWQiOiJyZW1vdGUtMDAyIn0=",
+      "employer_name": "Doist",
+      "job_employment_types": ["FULLTIME"],
+      "job_title": "Backend Engineer, Platform",
+      "job_apply_link": "https://himalayas.app/jobs/backend-engineer-platform-at-doist",
+      "job_description": "Fully remote role. Python, FastAPI, Celery, AWS. We are a distributed team.",
+      "job_is_remote": true,
+      "job_posted_at_datetime_utc": "2026-08-09T14:00:00.000Z",
+      "job_city": null,
+      "job_state": null,
+      "job_country": "US",
+      "job_min_salary": 120000,
+      "job_max_salary": 150000,
+      "job_salary_currency": "USD",
+      "job_salary_period": "YEAR",
+      "job_required_experience": {
+        "no_experience_required": false,
+        "required_experience_in_months": 36,
+        "experience_mentioned": true
+      },
+      "job_required_skills": ["Python", "FastAPI"]
+    },
+    {
+      "job_id": "eyJqb2JfaWQiOiJpbnRlcm4tMDAzIn0=",
+      "employer_name": "Halan",
+      "job_employment_type": "INTERN",
+      "job_title": "Backend Development Intern",
+      "job_apply_link": "https://wuzzuf.net/jobs/p/731044-Backend-Development-Intern-Giza",
+      "job_description": "Internship for students. Exposure to Python and Django. No prior experience required.",
+      "job_is_remote": false,
+      "job_posted_at_datetime_utc": "2026-08-10T08:00:00.000Z",
+      "job_city": "Giza",
+      "job_state": null,
+      "job_country": "EG",
+      "job_min_salary": 0,
+      "job_max_salary": 0,
+      "job_salary_currency": null,
+      "job_salary_period": null,
+      "job_required_experience": {
+        "no_experience_required": true,
+        "required_experience_in_months": 0
+      },
+      "job_required_skills": null
+    },
+    {
+      "job_id": "eyJqb2JfaWQiOiJicm9rZW4tMDA0In0=",
+      "employer_name": "MissingLink Corp",
+      "job_employment_type": "FULLTIME",
+      "job_title": "Backend Engineer",
+      "job_apply_link": null,
+      "job_google_link": null,
+      "job_description": "This record has no usable application URL and must be skipped.",
+      "job_is_remote": false,
+      "job_posted_at_datetime_utc": "2026-08-07T00:00:00.000Z",
+      "job_city": "Cairo",
+      "job_country": "EG"
+    },
+    {
+      "job_id": "eyJqb2JfaWQiOiJub2VtcGxveWVyLTAwNSJ9",
+      "employer_name": null,
+      "job_title": "Backend Engineer",
+      "job_apply_link": "https://example.com/jobs/no-employer",
+      "job_description": "This record has no employer name and must be skipped.",
+      "job_is_remote": false,
+      "job_posted_at_datetime_utc": "2026-08-07T00:00:00.000Z",
+      "job_city": "Cairo",
+      "job_country": "EG"
+    },
+    {
+      "job_id": "eyJqb2JfaWQiOiJiYWRkYXRlLTAwNiJ9",
+      "employer_name": "Instabug",
+      "job_employment_type": "CONTRACTOR",
+      "job_title": "Lead Backend Engineer",
+      "job_apply_link": "https://boards.greenhouse.io/instabug/jobs/5512334",
+      "job_description": "Contract role. Python, Django, Kubernetes.",
+      "job_is_remote": false,
+      "job_posted_at_datetime_utc": "not-a-timestamp",
+      "job_city": "Cairo",
+      "job_country": "EG",
+      "job_min_salary": null,
+      "job_max_salary": null,
+      "job_salary_currency": null,
+      "job_salary_period": null,
+      "job_required_experience": null,
+      "job_required_skills": null
+    }
+  ]
+}

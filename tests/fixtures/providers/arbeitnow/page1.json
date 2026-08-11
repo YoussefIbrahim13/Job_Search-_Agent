@@ -1,0 +1,89 @@
+{
+  "_meta": {
+    "origin": "synthetic",
+    "why": "Exercises Unix-timestamp parsing, the client-side keyword gate (which must keep Python roles and drop unrelated ones), remote flag handling, and job_types as a list. Arbeitnow publishes no salary at all, so it also pins that salary stays absent rather than being invented.",
+    "shape_note": "Envelope and field names follow the public Arbeitnow job-board API (arbeitnow.com/api/job-board-api). created_at is Unix epoch seconds."
+  },
+  "data": [
+    {
+      "slug": "senior-python-engineer-berlin-abc123",
+      "company_name": "Zalando",
+      "title": "Senior Python Engineer",
+      "description": "<p>Join our platform team in Berlin.</p><ul><li>Python, Django</li><li>PostgreSQL, Kubernetes</li></ul>",
+      "remote": false,
+      "url": "https://www.arbeitnow.com/jobs/companies/zalando/senior-python-engineer-berlin-abc123",
+      "tags": ["python", "django", "kubernetes"],
+      "job_types": ["full-time"],
+      "location": "Berlin",
+      "created_at": 1754476200
+    },
+    {
+      "slug": "remote-backend-python-def456",
+      "company_name": "Hellofresh",
+      "title": "Backend Engineer (Python)",
+      "description": "<p>Fully remote within the EU. Python and FastAPI.</p>",
+      "remote": true,
+      "url": "https://www.arbeitnow.com/jobs/companies/hellofresh/remote-backend-python-def456",
+      "tags": ["python", "fastapi"],
+      "job_types": ["full-time"],
+      "location": "Remote",
+      "created_at": 1754562600
+    },
+    {
+      "slug": "marketing-manager-hamburg-ghi789",
+      "company_name": "Beiersdorf",
+      "title": "Marketing Manager",
+      "description": "<p>Lead our brand campaigns in Hamburg. Experience with SEO and content strategy.</p>",
+      "remote": false,
+      "url": "https://www.arbeitnow.com/jobs/companies/beiersdorf/marketing-manager-hamburg-ghi789",
+      "tags": ["marketing", "seo"],
+      "job_types": ["full-time"],
+      "location": "Hamburg",
+      "created_at": 1754649000
+    },
+    {
+      "slug": "python-intern-munich-jkl012",
+      "company_name": "Celonis",
+      "title": "Working Student Python",
+      "description": "<p>Working student position using Python for data tooling.</p>",
+      "remote": false,
+      "url": "https://www.arbeitnow.com/jobs/companies/celonis/python-intern-munich-jkl012",
+      "tags": ["python"],
+      "job_types": ["internship"],
+      "location": "Munich",
+      "created_at": 1754735400
+    },
+    {
+      "slug": "broken-no-company-mno345",
+      "company_name": null,
+      "title": "Python Developer",
+      "description": "<p>This record has no company and must be skipped.</p>",
+      "remote": false,
+      "url": "https://www.arbeitnow.com/jobs/companies/unknown/broken-no-company-mno345",
+      "tags": ["python"],
+      "job_types": ["full-time"],
+      "location": "Berlin",
+      "created_at": 1754735400
+    },
+    {
+      "slug": "bad-timestamp-pqr678",
+      "company_name": "SAP",
+      "title": "Python Platform Engineer",
+      "description": "<p>Python platform work in Walldorf.</p>",
+      "remote": false,
+      "url": "https://www.arbeitnow.com/jobs/companies/sap/bad-timestamp-pqr678",
+      "tags": ["python"],
+      "job_types": ["full-time"],
+      "location": "Walldorf",
+      "created_at": 0
+    }
+  ],
+  "links": {
+    "first": "https://www.arbeitnow.com/api/job-board-api?page=1",
+    "next": "https://www.arbeitnow.com/api/job-board-api?page=2"
+  },
+  "meta": {
+    "current_page": 1,
+    "per_page": 100
+  }
+}
