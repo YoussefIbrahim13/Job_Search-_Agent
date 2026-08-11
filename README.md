@@ -222,31 +222,48 @@ pip install -r requirements.txt
 
 ### Configuration
 
-Copy the `.env` template and fill in your keys:
+Copy the template and fill in the two required keys:
 
 ```bash
-# .env
-GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxx
-TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxxxxxx
-
-# Model selection (default: LLaMA 3.3 70B on Groq)
-GROQ_MODEL=llama-3.3-70b-versatile
-
-# Tuning knobs
-MAX_AGENT_ITERATIONS=3    # Recommended ceiling — don't exceed without reason
-TAVILY_MAX_RESULTS=8      # Results fetched per Tavily query
-MAX_CV_CHARS=2000         # CV text sent to the LLM (context safety)
+cp .env.example .env        # Windows: copy .env.example .env
 ```
 
-> **Optional — Local LLM via Ollama:** Comment out the `GROQ_*` keys and uncomment the `OLLAMA_*` block in `.env`. Ensure `ollama serve` is running and pull your model (`ollama pull llama3.1:8b`).
+Then set `GROQ_API_KEY` and `TAVILY_API_KEY`. Everything else has a working
+default, so a minimal `.env` is just those two lines.
+
+[`.env.example`](.env.example) is the single source of truth for configuration —
+every variable is documented there with its default and the reasoning behind it,
+so this README does not repeat the list and cannot drift from it.
+
+> **Security:** `.env` is gitignored and must never be committed. If a key is
+> ever exposed, rotate it at the provider **first** — history rewriting does not
+> un-leak a key, because forks and clone caches keep the old blob.
+
+> **Optional — Local LLM via Ollama:** the `OLLAMA_*` fields in
+> `backend/core/config.py` are currently commented out, so the Ollama path is
+> inert until that code is re-enabled.
 
 ### Running the Server
 
 ```bash
-uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn backend.main:app --reload --host 127.0.0.1 --port 8888
 ```
 
-Then open **[http://localhost:8000](http://localhost:8000)** in your browser. The static frontend is served automatically by FastAPI.
+Then open **[http://localhost:8888](http://localhost:8888)** in your browser. The
+static frontend is served same-origin by FastAPI, and the page calls the API at
+the relative path `/api`, so the app works on whatever port you choose — just
+keep `CORS_ORIGINS` in step with it if you serve the frontend separately.
+
+### Running the Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite is offline and deterministic — no API keys and no network required.
+It covers the URL path gates, the staleness/zombie filters, ranking and output
+validation, CV experience extraction, and the retry helpers.
 
 ---
 

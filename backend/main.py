@@ -21,7 +21,7 @@ except (AttributeError, ValueError):
     pass
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, get_settings().log_level.upper(), logging.INFO),
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
@@ -75,12 +75,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Recruitment AI Agent API", lifespan=lifespan)
 
+# The SPA is served same-origin from the StaticFiles mount below, so in the
+# default deployment CORS never engages at all. These origins exist for split
+# dev setups (e.g. a Vite dev server on another port). allow_origins must stay
+# an explicit list rather than "*": the wildcard is invalid alongside
+# allow_credentials and browsers reject such responses outright.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=get_settings().cors_origin_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 app.include_router(router)
