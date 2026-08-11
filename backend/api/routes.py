@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -52,9 +53,43 @@ router = APIRouter()
 MAX_CV_BYTES: int = 10 * 1024 * 1024   # 10 MB
 
 # Maximum wall-clock seconds to wait for the agent graph to complete.
-# Tune this to match your Ollama model's typical response latency.
-# A 5-minute window comfortably covers a 5-iteration search on most hardware.
+# A 5-minute window comfortably covers a multi-iteration search.
 AGENT_TIMEOUT_SECONDS: int = 300
+
+
+def _is_llm_quota_error(exc: BaseException) -> bool:
+    """
+    True when a failure is an LLM provider rate/quota limit rather than a bug.
+
+    Groq's free tier enforces a daily token budget; once exhausted, every call
+    fails for hours. Reporting that as a generic 500 "unexpected error" tells
+    the user to retry something that cannot succeed, and hides an operational
+    condition that needs a plan upgrade or a wait.
+    """
+    if type(exc).__name__ in ("RateLimitError", "TooManyRequests"):
+        return True
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if status == 429:
+        return True
+    text = str(exc).lower()
+    return "rate limit" in text or "rate_limit_exceeded" in text
+
+
+def _quota_message(exc: BaseException) -> str:
+    """User-facing quota message, including the provider's own retry hint."""
+    base = (
+        "The AI provider's usage limit has been reached, so no new searches can "
+        "run right now."
+    )
+    # Groq embeds "Please try again in 1h12m6.048s" in the error body. The
+    # duration must end in a unit letter, otherwise a trailing sentence period
+    # is captured and the message renders as "...56m25.152s..".
+    hint = re.search(r"try again in ([0-9][0-9hms.]*[hms])", str(exc), re.IGNORECASE)
+    if hint:
+        return f"{base} Please try again in about {hint.group(1)}."
+    return f"{base} Please try again later."
 
 # Generic message returned for ANY magic-byte mismatch. Deliberately vague —
 # it does not tell an attacker which check tripped (wrong signature vs.
@@ -277,7 +312,10 @@ async def targeted_search_endpoint(request: SearchRequest):
                 "Please try again."
             ),
         )
-    except Exception:
+    except Exception as exc:
+        if _is_llm_quota_error(exc):
+            logger.warning("LLM quota exhausted during targeted search: %s", exc)
+            raise HTTPException(status_code=429, detail=_quota_message(exc))
         logger.exception("Unexpected error in targeted_search_endpoint")
         raise HTTPException(
             status_code=500,
@@ -375,12 +413,16 @@ async def analyze_cv_endpoint(
     # profile.detected_title — e.g. "Software Engineer" inferred from CV header
     #   (was ignored in the original routes.py, causing the title-hint feature
     #   to never fire; now forwarded correctly)
+    # preferred_location is passed INTO the search. It used to be applied only
+    # to the response afterwards, so the agent searched with no location at all
+    # and the response then reported a location that was never used.
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(
                 run_cv_analysis,
                 profile.raw_text,
                 profile.detected_title,
+                preferred_location.strip(),
             ),
             timeout=AGENT_TIMEOUT_SECONDS,
         )
@@ -397,7 +439,10 @@ async def analyze_cv_endpoint(
                 "Please try again."
             ),
         )
-    except Exception:
+    except Exception as exc:
+        if _is_llm_quota_error(exc):
+            logger.warning("LLM quota exhausted during CV analysis: %s", exc)
+            raise HTTPException(status_code=429, detail=_quota_message(exc))
         logger.exception("Unexpected error in analyze_cv_endpoint")
         raise HTTPException(
             status_code=500,
@@ -407,19 +452,21 @@ async def analyze_cv_endpoint(
     # ── 6. Attach lightweight profile metadata ─────────────────────────────
     #
     # The frontend expects a "profile" key alongside the jobs array.
-    # We populate skills from the first matched job (best available proxy when
-    # the agent hasn't returned a dedicated skills field).
+    #
+    # experience_level is derived from the CV, not asserted. It was previously
+    # the hardcoded string "Professional" for every candidate regardless of
+    # content, rendered to the user as a confident "LEVEL:" badge. `None` means
+    # "we could not tell" and the UI shows nothing — a blank is honest, a wrong
+    # label is not. Phase 3 replaces this with a user-editable profile field.
     result["profile"] = {
         "detected_title":   profile.detected_title,
         "word_count":       profile.word_count,
-        "experience_level": "Professional",
-       "skills": profile.skills,
+        "experience_level": profile.seniority,
+        "years_experience": profile.years_experience,
+        "skills":           profile.skills,
         "summary": (
             "CV analysed successfully. Matching jobs based on extracted skills."
         ),
     }
-
-    if preferred_location:
-        result["location"] = preferred_location
 
     return result

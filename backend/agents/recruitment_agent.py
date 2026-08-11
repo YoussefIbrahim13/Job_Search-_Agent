@@ -46,6 +46,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Dict, List, Optional, Sequence, TypedDict
+from urllib.parse import urlparse
 
 from langchain_core.messages import (
     AIMessage,
@@ -61,15 +62,18 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
+from backend.agents.prompts import render_boards_compact
 from backend.agents.tools import (
     APPROVED_SEARCH_BOARDS,
+    get_filter_stats,
     get_tools,
+    reset_filter_stats,
     _is_blacklisted_domain,
     _is_content_pollution_domain,
     _passes_path_gate,    # FIX N
-    _snippet_is_stale,    # FIX O
 )
 from backend.core.config import get_settings
+from backend.core.resilience import groq_retry
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +82,23 @@ logger = logging.getLogger(__name__)
 # Compiled regex patterns
 # ---------------------------------------------------------------------------
 
+# Search/category URL shapes that are never a single vacancy.
+#
+# `/jobs/?$` was removed: it fired on legitimate listing paths on boards whose
+# canonical form ends in a /jobs segment, and `_passes_path_gate` (tools.py)
+# already makes a stricter, per-board POSITIVE assertion about the path. Keep
+# this list to patterns that are unambiguously search/aggregation surfaces.
 _BAD_URL_RE = re.compile(
-    r"/search|\?q=|-jobs-in-|/find-jobs|keyword=|/jobs/?$|/pulse/",
+    r"/search|\?q=|-jobs-in-|/find-jobs|keyword=|/pulse/",
     re.IGNORECASE,
 )
-_FAKE_LINK_RE = re.compile(r"/jobs/view/\d+$")
+
+# NOTE: there was a `_FAKE_LINK_RE = r"/jobs/view/\d+$"` here that rejected
+# LinkedIn's canonical numeric listing URL — the exact shape that
+# tools._BOARD_PATH_PATTERNS["linkedin.com"] admits a few lines earlier. Every
+# numeric-ID LinkedIn job the pipeline validated was then discarded. The path
+# gate is the correct check and runs first; this one was pure false-positive.
+# tests/unit/test_url_gates.py::test_gates_agree guards against a reintroduction.
 
 # Kept in sync with tools._CATEGORY_PAGE_TITLE_RE (FIX M: second line of
 # defense in the validation layer, after the tool-layer pre-filter).
@@ -90,9 +106,28 @@ _AGGREGATOR_TITLE_RE = re.compile(
     r"\d+\+?\s*(jobs?|vacancies|positions?|openings?)\b"
     r"|\bjobs?\s+in\s+[A-Za-z]"
     r"|\bvacancies\s+in\s+[A-Za-z]"
-    r"|\b(browse|search)\s+(all\s+)?jobs?\b"
+    r"|\b(browse|search|find|explore)\s+(all\s+)?jobs?\b"
+    # Reversed word order: "Job Search | Indeed", "Jobs Search Results".
+    # Observed live — the forms above only matched "search jobs", so this
+    # extremely common page title slipped through and was rendered to the user
+    # as a vacancy at company "Unknown".
+    r"|\bjobs?\s+(search|listings?|results?|board)\b"
     r"|\ball\s+jobs?\b"
-    r"|\blatest\s+jobs?\b",
+    r"|\blatest\s+jobs?\b"
+    r"|\bhiring\s+now\b"
+    r"|\bcareer\s+opportunities\b"
+    # Arabic category pages. The app's approved boards include Wuzzuf, Bayt and
+    # Akhtaboot, and LinkedIn serves Arabic category pages to MENA users, so an
+    # English-only aggregator filter misses a large share of the real traffic.
+    # Observed live: "١٠٠+ Java Developer من الوظائف، التوظيف في محافظة القاهرة"
+    # ("100+ Java Developer jobs, hiring in Cairo governorate") was returned as
+    # a vacancy. Note Arabic-Indic digits — \d does not match them here.
+    r"|[٠-٩\d]+\s*\+\s*(?:من\s+)?(?:ال)?وظائف"
+    r"|\bوظائف\s+في\b"
+    r"|(?:ال)?توظيف\s+في\b"
+    r"|\bجميع\s+(?:ال)?وظائف\b"
+    r"|\bأحدث\s+(?:ال)?وظائف\b"
+    r"|\bشواغر\s+في\b",
     re.IGNORECASE,
 )
 
@@ -133,7 +168,17 @@ _TOOL_LISTING_RE = re.compile(
 )
 
 _TAVILY_TOOL_NAME            = "tavily_job_search"
-_RECOMMENDED_MAX_ITERATIONS  = 3
+
+# Cost guard, not a target. The planned flow needs 2 query turns plus a
+# finalising turn; 4 is the default, leaving one spare for a retried 429. Above
+# this the model is looping rather than converging, so warn.
+_RECOMMENDED_MAX_ITERATIONS  = 6
+
+# Jobs scoring below this are dropped rather than shown. Deliberately low for
+# now: the score is entirely LLM-authored and therefore noisy, so this only
+# removes clear non-matches. Phase 2 replaces the score with a mostly
+# deterministic one and raises this to a meaningful relevance bar.
+MIN_MATCH_SCORE = 25
 
 # Current year — injected into the system prompt so the model's recency
 # instructions never hard-code a stale year across calendar boundaries.
@@ -151,6 +196,11 @@ class AgentState(TypedDict):
     queries_executed:      int
     internship_query_done: bool
     coercion_injected:     bool
+    # What the user actually asked for. Carried through the graph so the
+    # recovery paths in graceful_exit_node can label their output truthfully
+    # instead of guessing (they used to hardcode "Frontend Developer"/"Cairo").
+    search_job_title:      str
+    search_location:       str
 
 
 # ---------------------------------------------------------------------------
@@ -193,31 +243,12 @@ def _extract_search_state(messages: Sequence[BaseMessage]) -> tuple[int, bool]:
 # Approved board reference string
 # ---------------------------------------------------------------------------
 
-def _build_approved_boards_prompt_block() -> str:
-    global_boards  = ["linkedin", "indeed", "glassdoor"]
-    mena_boards    = ["wuzzuf", "bayt", "akhtaboot"]
-    remote_boards  = ["weworkremotely", "remoteok", "himalayas"]
-    tech_boards    = ["wellfound", "dice"]
-    ats_boards     = ["greenhouse", "lever"]
-
-    groups = [
-        ("Global",                 global_boards),
-        ("MENA/Gulf",              mena_boards),
-        ("Remote",                 remote_boards),
-        ("Tech",                   tech_boards),
-        ("Direct ATS (freshest)",  ats_boards),
-    ]
-    lines = []
-    for label, keys in groups:
-        tokens = [
-            APPROVED_SEARCH_BOARDS[k] for k in keys if k in APPROVED_SEARCH_BOARDS
-        ]
-        if tokens:
-            lines.append(f"{label}: {', '.join(tokens)}")
-    return "\n".join(lines)
-
-
-_APPROVED_BOARDS_BLOCK = _build_approved_boards_prompt_block()
+# The board grouping used to be duplicated here and in the tool description,
+# independently of APPROVED_SEARCH_BOARDS itself — so adding a board to the
+# registry taught the filter layer about it but told the model nothing, and it
+# would never be searched. Both renderings now come from prompts.BOARD_GROUPS,
+# which asserts at import that every registered board is grouped.
+_APPROVED_BOARDS_BLOCK = render_boards_compact()
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +420,28 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
 # Output normalisation
 # ---------------------------------------------------------------------------
 
+def _canonical_url_key(url: str) -> str:
+    """
+    Normalise a listing URL into a dedup key.
+
+    Two links point at the same posting when they differ only by scheme, a www.
+    prefix, tracking query parameters, a fragment, or a trailing slash — which
+    is exactly how the same job comes back from two parallel queries.
+
+    Falls back to the raw lowercased string if the URL can't be parsed, so an
+    unparseable link still dedups against an identical unparseable link.
+    """
+    try:
+        parsed = urlparse(url.strip())
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        path = (parsed.path or "").rstrip("/").lower()
+        return f"{netloc}{path}"
+    except Exception:
+        return url.strip().lower()
+
+
 def _normalise_skills(skills: Any) -> List[str]:
     if skills is None:
         return []
@@ -400,18 +453,20 @@ def _normalise_skills(skills: Any) -> List[str]:
     return [str(skills).strip()]
 
 
-def _validate_and_fix_output(
-    raw: Dict[str, Any],
-    *,
-    cap_score: Optional[int] = None,
-) -> Dict[str, Any]:
+def _validate_and_fix_output(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     Validate and sanitise the LLM JSON output.
 
-    FIX N/O: adds 'path_gate' and 'stale' as named drop-reason buckets.
-    FIX M:   full visibility logging preserved.
-    FIX R:   also called on the synthetic raw dict built from ToolMessages,
-             so recovered listings pass the same validation as model output.
+    Runs exactly once per search, inside graceful_exit_node, so both public
+    entry points return an identically-shaped result. Also called on the
+    synthetic dict built from ToolMessages, so recovered listings pass the same
+    validation as model output.
+
+    Drops are counted per reason and logged as a histogram — that summary is the
+    fastest way to spot an over-firing filter.
+
+    Finally deduplicates by normalised URL, sorts by match_score descending, and
+    drops anything below MIN_MATCH_SCORE.
     """
     job_title = raw.get("job_title", "Unknown Position")
     location  = raw.get("location",  "Various")
@@ -429,8 +484,9 @@ def _validate_and_fix_output(
         "blacklist":           0,
         "pollution":           0,
         "path_gate":           0,
-        "stale":               0,
         "bad_link":            0,
+        "duplicate":           0,
+        "below_threshold":     0,
     }
 
     for job in jobs_raw:
@@ -476,18 +532,18 @@ def _validate_and_fix_output(
             not link
             or link in ("#", "null", "None", "N/A", "n/a")
             or not _VALID_URL_RE.match(link)
-            or _FAKE_LINK_RE.search(link)
             or _BAD_URL_RE.search(link)
         ):
             drop_reasons["bad_link"] += 1
             logger.debug("Post-proc drop [bad-link]: %r link=%r", title, link)
             continue
 
-        snippet_candidate = str(job.get("match_reason", ""))
-        if _snippet_is_stale(snippet_candidate, title):
-            drop_reasons["stale"] += 1
-            logger.debug("Post-proc drop [stale]: %r", title)
-            continue
+        # NOTE: no staleness check here by design. It used to run against
+        # `job["match_reason"]` — a sentence the MODEL wrote, not the source
+        # snippet — so it dropped jobs whose generated prose happened to mention
+        # a year or a closure word, while being blind to actual staleness. The
+        # real check already ran in tools.tavily_job_search against the real
+        # snippet, before the model ever saw the listing.
 
         skills = _normalise_skills(job.get("required_skills"))
         job["required_skills"] = [s for s in skills if not _FAKE_SKILL_RE.match(s)]
@@ -497,8 +553,6 @@ def _validate_and_fix_output(
         except (TypeError, ValueError):
             score = 50
         score = max(5, min(score, 98))
-        if cap_score is not None:
-            score = min(score, cap_score)
         job["match_score"] = score
 
         salary = str(job.get("salary_range", "")).strip()
@@ -524,29 +578,63 @@ def _validate_and_fix_output(
 
         if job.get("source") in ("", "Web", None):
             try:
-                from urllib.parse import urlparse
                 job["source"] = urlparse(link).netloc or "Web"
             except Exception:
                 job["source"] = "Web"
 
         jobs_fixed.append(job)
 
+    # --- Deduplicate, rank, threshold --------------------------------------
+    #
+    # None of this existed before: the two parallel queries could return the
+    # same posting twice, results were rendered in whatever order the model
+    # happened to emit them, and no job was ever excluded for being a poor
+    # match. "Ranked results" was not true of the output.
+
+    deduped: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for job in jobs_fixed:
+        key = _canonical_url_key(str(job.get("application_link", "")))
+        if key in seen_keys:
+            drop_reasons["duplicate"] += 1
+            logger.debug("Post-proc drop [duplicate]: %r", job.get("job_title"))
+            continue
+        seen_keys.add(key)
+        deduped.append(job)
+
+    ranked = sorted(deduped, key=lambda j: j.get("match_score", 0), reverse=True)
+
+    above_threshold = [j for j in ranked if j.get("match_score", 0) >= MIN_MATCH_SCORE]
+    drop_reasons["below_threshold"] = len(ranked) - len(above_threshold)
+
     if jobs_raw:
         logger.info(
             "Validation: kept %d / %d raw jobs | dropped → %s",
-            len(jobs_fixed), len(jobs_raw),
+            len(above_threshold), len(jobs_raw),
             ", ".join(f"{k}={v}" for k, v in drop_reasons.items() if v) or "none",
         )
-    if not jobs_raw:
+    else:
         logger.info("Validation: model returned an empty jobs array (0 raw jobs).")
+
+    # The model writes agent_summary BEFORE validation runs, so it reports the
+    # count it emitted ("I found 8 listings") while the user is shown the count
+    # that survived dedup and filtering. Append a reconciliation note rather
+    # than letting the two contradict each other on screen.
+    summary = str(raw.get("agent_summary") or "Search complete.")
+    dropped_total = len(jobs_raw) - len(above_threshold)
+    if jobs_raw and dropped_total > 0:
+        summary += (
+            f" ({dropped_total} of {len(jobs_raw)} raw results were removed as "
+            f"duplicates or low-relevance matches; {len(above_threshold)} shown.)"
+        )
 
     return {
         "job_title":           job_title,
         "location":            location,
-        "total_found":         len(jobs_fixed),
-        "agent_summary":       raw.get("agent_summary", "Search complete."),
+        "total_found":         len(above_threshold),
+        "agent_summary":       summary,
         "search_queries_used": raw.get("search_queries_used", []),
-        "jobs":                jobs_fixed,
+        "jobs":                above_threshold,
     }
 
 
@@ -558,11 +646,15 @@ def _validate_and_fix_output(
 def _get_llm_with_tools() -> Any:
     settings = get_settings()
 
+    # max_tokens must cover the ENTIRE jobs array in one response. At 2000 the
+    # model ran out mid-array at roughly 6-8 jobs and the output was salvaged
+    # only by the brace-repair heuristic in _extract_json — which silently
+    # discards the truncated tail. 4096 makes that path a genuine last resort.
     llm = ChatGroq(
         model=settings.groq_model,
         api_key=settings.groq_api_key,
         temperature=0.0,
-        max_tokens=2000,
+        max_tokens=4096,
     )
 
     tools = get_tools()
@@ -589,7 +681,14 @@ def llm_node(state: AgentState) -> Dict[str, Any]:
         state["queries_executed"], state["internship_query_done"],
     )
 
-    response: AIMessage = llm_with_tools.invoke(state["messages"])
+    # Retry transient Groq failures (429/5xx) with backoff. Without this a
+    # single rate-limit response consumed an agent iteration and pushed the run
+    # toward the ToolMessage recovery path.
+    @groq_retry
+    def _invoke() -> AIMessage:
+        return llm_with_tools.invoke(state["messages"])
+
+    response: AIMessage = _invoke()
 
     if getattr(response, "tool_calls", None):
         logger.info(
@@ -615,8 +714,43 @@ def llm_node(state: AgentState) -> Dict[str, Any]:
 # FIX R — ToolMessage fallback helper
 # ---------------------------------------------------------------------------
 
+# Words that carry no discriminating signal when comparing a job title to a
+# search query — nearly every posting contains at least one.
+_TITLE_STOPWORDS = frozenset({
+    "a", "an", "and", "at", "for", "in", "of", "or", "the", "to", "with",
+    "job", "jobs", "vacancy", "hiring", "career", "careers", "opportunity",
+    "full", "time", "part", "remote", "hybrid", "onsite", "new",
+})
+
+
+def _title_tokens(title: str) -> set[str]:
+    """Lowercase, punctuation-free content words from a job title."""
+    words = re.findall(r"[a-z0-9#+.]+", title.lower())
+    return {w for w in words if w not in _TITLE_STOPWORDS and len(w) > 1}
+
+
+def _is_relevant_to_search(job_title: str, searched_title: str) -> bool:
+    """
+    Cheap deterministic relevance gate for RECOVERED listings.
+
+    The recovery path scrapes whatever listings happen to be sitting in earlier
+    tool results, which is how a "Human Resources Coordinator" was returned for
+    a "Java Developer" search (observed live). Unlike model-scored jobs, these
+    carry no judgement about whether they match — so require at least one shared
+    content word with what the user actually asked for.
+
+    Permissive by design: it removes the obviously-unrelated, not the merely
+    imperfect. With no search title to compare against, everything passes.
+    """
+    wanted = _title_tokens(searched_title)
+    if not wanted:
+        return True
+    return bool(wanted & _title_tokens(job_title))
+
+
 def _extract_listings_from_tool_messages(
     messages: Sequence[BaseMessage],
+    searched_title: str = "",
 ) -> List[Dict[str, Any]]:
     """
     FIX R: Parse raw ToolMessage content for the numbered listing blocks
@@ -631,10 +765,12 @@ def _extract_listings_from_tool_messages(
     (i.e. the iteration cap fired while the model was mid-tool-call).
 
     Scans ToolMessages newest-first so the most recent search results win
-    on URL deduplication.
+    on URL deduplication. Listings unrelated to `searched_title` are skipped —
+    these are unscored scrapes, so nothing else vouches for their relevance.
     """
     jobs:      List[Dict[str, Any]] = []
     seen_urls: set[str]             = set()
+    skipped_irrelevant              = 0
 
     for msg in reversed(messages):
         if not isinstance(msg, ToolMessage):
@@ -651,6 +787,11 @@ def _extract_listings_from_tool_messages(
                 continue
             seen_urls.add(url)
 
+            if not _is_relevant_to_search(title, searched_title):
+                skipped_irrelevant += 1
+                logger.debug("Recovery skip [irrelevant]: %r", title)
+                continue
+
             jobs.append({
                 "company_name":      "Unknown",
                 "job_title":         title,
@@ -666,6 +807,12 @@ def _extract_listings_from_tool_messages(
                 "source":            "Web",
                 "application_link":  url,
             })
+
+    if skipped_irrelevant:
+        logger.info(
+            "Recovery: skipped %d listing(s) unrelated to %r.",
+            skipped_irrelevant, searched_title,
+        )
 
     return jobs
 
@@ -693,19 +840,32 @@ def graceful_exit_node(state: AgentState) -> Dict[str, Any]:
             break
 
     if raw and raw.get("jobs"):
-        logger.info("RAW_JSON_BEFORE_VALIDATION >>>\n%s", json.dumps(raw, indent=2, ensure_ascii=False)[:4000])
+        # PRIVACY: the raw model output echoes back CV-derived context. Keep the
+        # full dump at DEBUG; INFO gets a count only.
+        logger.info("Model returned %d raw job(s) before validation.", len(raw.get("jobs") or []))
+        logger.debug(
+            "RAW_JSON_BEFORE_VALIDATION >>>\n%s",
+            json.dumps(raw, indent=2, ensure_ascii=False)[:4000],
+        )
         result = _validate_and_fix_output(raw)
         return {"final_output": result}
 
     logger.warning("graceful_exit: Model returned empty or no JSON. Attempting recovery from ToolMessages...")
     
-    tool_jobs = _extract_listings_from_tool_messages(state["messages"])
+    tool_jobs = _extract_listings_from_tool_messages(
+        state["messages"], state.get("search_job_title", "")
+    )
+
+    # Label recovery output with what the user ACTUALLY searched for. These
+    # values reach the UI, so a placeholder here is a user-visible lie.
+    searched_title    = state.get("search_job_title") or "Unknown"
+    searched_location = state.get("search_location") or "Various"
 
     if tool_jobs:
         logger.info("FIX R+: recovered %d listing(s) from ToolMessages.", len(tool_jobs))
         synthetic_raw: Dict[str, Any] = {
-            "job_title": "Frontend Developer", 
-            "location": "Cairo",
+            "job_title": searched_title,
+            "location": searched_location,
             "total_found": len(tool_jobs),
             "agent_summary": f"Model returned empty, but recovered {len(tool_jobs)} listing(s) from search results.",
             "search_queries_used": [],
@@ -715,8 +875,8 @@ def graceful_exit_node(state: AgentState) -> Dict[str, Any]:
     else:
         logger.warning("FIX R+: No listings recoverable.")
         result = {
-            "job_title": "Unknown",
-            "location": "Various",
+            "job_title": searched_title,
+            "location": searched_location,
             "total_found": 0,
             "agent_summary": "The agent could not produce a structured response.",
             "search_queries_used": [],
@@ -817,7 +977,20 @@ def _get_graph() -> Any:
 # Internal graph runner (preserved)
 # ---------------------------------------------------------------------------
 
-def _invoke_graph(user_message: str, cv_text: str = "") -> Dict[str, Any]:
+def _invoke_graph(
+    user_message: str,
+    cv_text: str = "",
+    *,
+    job_title: str = "",
+    location: str = "",
+) -> Dict[str, Any]:
+    """
+    Run the agent graph and return validated output.
+
+    `job_title`/`location` are the user's actual search terms. They are carried
+    in graph state purely so the recovery paths can label their output honestly;
+    they never influence the model's reasoning.
+    """
     graph = _get_graph()
 
     system_content = _SYSTEM_PROMPT
@@ -838,9 +1011,12 @@ def _invoke_graph(user_message: str, cv_text: str = "") -> Dict[str, Any]:
         "queries_executed":      0,
         "internship_query_done": False,
         "coercion_injected":     False,
+        "search_job_title":      job_title,
+        "search_location":       location,
     }
 
     logger.info("Starting recruitment agent graph…")
+    reset_filter_stats()
     final_state = graph.invoke(initial_state)
     logger.info(
         "Graph finished | iterations=%d | queries=%d | intern_done=%s",
@@ -849,14 +1025,54 @@ def _invoke_graph(user_message: str, cv_text: str = "") -> Dict[str, Any]:
         final_state.get("internship_query_done", False),
     )
 
-    return final_state.get("final_output") or {
-        "job_title":           "Unknown",
-        "location":            "Various",
+    result = final_state.get("final_output") or {
+        "job_title":           job_title or "Unknown",
+        "location":            location or "Various",
         "total_found":         0,
         "agent_summary":       "Agent produced no output.",
         "search_queries_used": [],
         "jobs":                [],
     }
+
+    # An empty result set is a legitimate outcome — most often "every listing we
+    # found was a category page or an expired posting". Say so. "0 FOUND" beside
+    # a generic failure message is indistinguishable from a broken app, and the
+    # old text ("could not produce a structured response") was actively wrong:
+    # the pipeline ran correctly and rejected everything on purpose.
+    if not result.get("jobs"):
+        result["agent_summary"] = _explain_empty_result(get_filter_stats())
+    result["filter_stats"] = get_filter_stats()
+
+    return result
+
+
+def _explain_empty_result(stats: Dict[str, int]) -> str:
+    """Turn the request's filter tally into a plain-language explanation."""
+    examined = stats.get("examined", 0)
+    if not examined:
+        return (
+            "No job listings were returned by the search provider for this "
+            "query. Try a broader role title, or a different location spelling."
+        )
+
+    reasons = []
+    if stats.get("closed"):
+        reasons.append(f"{stats['closed']} were expired or no longer accepting applications")
+    if stats.get("category"):
+        reasons.append(f"{stats['category']} were category or search-results pages, not individual jobs")
+    if stats.get("path_gate"):
+        reasons.append(f"{stats['path_gate']} were not individual job postings")
+    if stats.get("blocked"):
+        reasons.append(f"{stats['blocked']} were from blocked or unusable sources")
+
+    detail = "; ".join(reasons) if reasons else "none matched the search criteria"
+    return (
+        f"Checked {examined} listing(s) across the job boards, but none were "
+        f"suitable: {detail}. This usually means there are few live openings "
+        f"matching these exact terms right now — try a broader job title "
+        f"(e.g. '.NET Developer' rather than '.NET'), a nearby location, or "
+        f"searching again in a few days."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -898,7 +1114,11 @@ def _extract_tech_stack_from_cv(cv_text: str) -> List[str]:
 # Public API (preserved, unmodified)
 # ---------------------------------------------------------------------------
 
-def run_cv_analysis(cv_text: str, detected_title: str = "") -> Dict[str, Any]:
+def run_cv_analysis(
+    cv_text: str,
+    detected_title: str = "",
+    preferred_location: str = "",
+) -> Dict[str, Any]:
     found_tech = _extract_tech_stack_from_cv(cv_text)
     stack_str  = (
         ", ".join(found_tech[:10]) if found_tech
@@ -907,8 +1127,23 @@ def run_cv_analysis(cv_text: str, detected_title: str = "") -> Dict[str, Any]:
 
     title_hint = f" Likely title: '{detected_title}'." if detected_title else ""
 
+    # The user's preferred location must reach the QUERY, not just the response.
+    # It used to be collected by the API and stapled onto the result afterwards,
+    # so the search ran location-less and the response then claimed otherwise.
+    location_token = preferred_location.strip()
+    if location_token:
+        location_hint = (
+            f"\n\nTARGET LOCATION (include verbatim in EVERY query, no "
+            f"preposition): {location_token}\n"
+        )
+        location_example = f"{location_token} "
+    else:
+        location_hint = ""
+        location_example = ""
+
     user_message = (
-        f"A candidate uploaded their CV (see system message above).{title_hint}\n\n"
+        f"A candidate uploaded their CV (see system message above).{title_hint}"
+        f"{location_hint}\n\n"
         f"PRIMARY TECH STACK (from CV, use in every query): {stack_str}\n\n"
         f"Find matching jobs AND internships for this candidate. Fire BOTH the "
         f"full-time query and the internship query as PARALLEL tool calls in "
@@ -917,14 +1152,19 @@ def run_cv_analysis(cv_text: str, detected_title: str = "") -> Dict[str, Any]:
         f"stray 'Go') in front of it. Each query needs a technology keyword and "
         f"an approved site: clause; use a different board for each of the two "
         f"calls. Example pair:\n"
-        f"  '{found_tech[0] if found_tech else '<TECH>'} developer jobs "
-        f"site:wuzzuf.net OR site:bayt.com'\n"
-        f"  '{found_tech[0] if found_tech else '<TECH>'} developer internship "
-        f"site:linkedin.com/jobs'\n"
+        f"  '{found_tech[0] if found_tech else '<TECH>'} developer "
+        f"{location_example}jobs site:wuzzuf.net OR site:bayt.com'\n"
+        f"  '{found_tech[0] if found_tech else '<TECH>'} developer "
+        f"{location_example}internship site:linkedin.com/jobs'\n"
         f"Emit the final JSON only after both calls have returned."
     )
 
-    return _invoke_graph(user_message, cv_text=cv_text)
+    return _invoke_graph(
+        user_message,
+        cv_text=cv_text,
+        job_title=detected_title,
+        location=location_token,
+    )
 
 
 def run_targeted_search(job_title: str, location: str) -> Dict[str, Any]:
@@ -979,5 +1219,11 @@ def run_targeted_search(job_title: str, location: str) -> Dict[str, Any]:
         f"than inventing listings."
     )
 
-    result = _invoke_graph(user_message)
-    return _validate_and_fix_output(result, cap_score=75)
+    # NOTE: this used to be `_validate_and_fix_output(result, cap_score=75)` —
+    # a SECOND validation pass over a dict graceful_exit_node had already
+    # validated. Two problems: the re-run scanned already-defaulted fields
+    # (match_reason had become "Matches the search criteria."), and the 75 cap
+    # meant no targeted-search job could ever reach the UI's "high match" band
+    # at >=75, while run_cv_analysis applied no cap at all. Both entry points
+    # now return the same once-validated shape.
+    return _invoke_graph(user_message, job_title=job_title, location=location)

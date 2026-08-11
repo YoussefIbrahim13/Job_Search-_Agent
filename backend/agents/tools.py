@@ -114,6 +114,7 @@ from __future__ import annotations
 import logging
 import re
 import html
+import threading
 import urllib.error
 import urllib.request
 import concurrent.futures
@@ -124,7 +125,12 @@ from urllib.parse import urlparse
 
 from langchain_core.tools import tool
 
+from backend.agents.prompts import (
+    APPROVED_SEARCH_BOARDS as _APPROVED_SEARCH_BOARDS,
+    TAVILY_TOOL_DESCRIPTION,
+)
 from backend.core.config import get_settings
+from backend.core.resilience import tavily_retry
 
 logger = logging.getLogger(__name__)
 
@@ -133,9 +139,62 @@ logger = logging.getLogger(__name__)
 # Token-safety constants
 # ---------------------------------------------------------------------------
 
-MAX_RESULT_CHARS: int = 3_000
+# Character budget for the listing block handed to the model per tool call.
+#
+# At 3,000 this was the real bottleneck on recall, not a token-safety measure:
+# with SNIPPET_CHARS at 600 it admitted roughly 5 listings, and live runs were
+# observed discarding surviving results ("budget allowed only 3 / 6 filtered
+# listings"). Those listings had already passed every filter — they were dropped
+# purely for want of room.
+#
+# 9,000 chars is ~2,250 tokens per tool result. With two parallel calls and
+# max_tokens raised to 4,096, that sits comfortably inside the 70B model's
+# context while roughly tripling how many vetted listings it gets to score.
+MAX_RESULT_CHARS: int = 9_000
 SNIPPET_CHARS: int    = 600
 PAGE_CHARS: int       = 1_800
+
+
+# ---------------------------------------------------------------------------
+# Request-scoped filter statistics
+# ---------------------------------------------------------------------------
+#
+# Why this exists: a search can legitimately return nothing, and "0 FOUND" with
+# no explanation is indistinguishable from a broken app. A real run for
+# ".net / cairo" examined 10 listings and rejected all of them — 5 category
+# pages and 5 verified-closed postings — yet the user was told only that the
+# agent "could not produce a structured response", which was both unhelpful and
+# untrue. These counters let the response say what actually happened.
+#
+# Thread-local rather than global: each HTTP request runs the whole graph in its
+# own thread via asyncio.to_thread, so concurrent searches must not share
+# counters. The tool body increments these on the request thread; the live-probe
+# worker pool only returns values back to it.
+
+_stats = threading.local()
+
+
+def reset_filter_stats() -> None:
+    """Begin a new request's tally. Call once before invoking the graph."""
+    _stats.data = {
+        "examined": 0, "kept": 0, "category": 0,
+        "closed": 0, "path_gate": 0, "blocked": 0,
+    }
+
+
+def record_filter_stats(**counts: int) -> None:
+    """Accumulate one tool call's drop counts into the current request."""
+    data = getattr(_stats, "data", None)
+    if data is None:
+        return  # not inside a tracked request (e.g. a direct unit-test call)
+    for key, value in counts.items():
+        if key in data:
+            data[key] += value
+
+
+def get_filter_stats() -> Dict[str, int]:
+    """Return the current request's tally (empty when untracked)."""
+    return dict(getattr(_stats, "data", {}) or {})
 
 
 # ---------------------------------------------------------------------------
@@ -435,15 +494,33 @@ _AR_MONTHS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Declarations that a listing is dead.
+#
+# These are REGEX FRAGMENTS, not literal substrings, and every one of them must
+# be anchored (\b or a required neighbouring word). They are NOT re.escape'd.
+#
+# Why this matters: this list previously contained the bare substring "closed",
+# escaped into a boundary-free alternation. It therefore matched inside
+# "undisclosed", "disclosed", "enclosed", "closed-loop" and "closed captions" —
+# and "salary undisclosed" is routine phrasing on Bayt and Wuzzuf, which carry
+# most of this app's MENA coverage. It was the single largest source of dropped
+# real jobs in the pipeline.
+#
+# Rule for anyone adding a phrase here: require the surrounding words that make
+# it a closure declaration. "closed" alone is a substring of ordinary English;
+# "vacancy closed" is a statement about this job.
 _ZOMBIE_CONTENT_SNIPPETS_EN: tuple[str, ...] = (
-    "no longer accepting applications",
-    "position filled",
-    "job expired",
-    "this job is no longer available",
-    "applications closed",
-    "this position has been filled",
-    "vacancy closed",
-    "closed",
+    r"\bno longer accepting applications\b",
+    r"\bposition filled\b",
+    r"\bjob expired\b",
+    r"\bthis job is no longer available\b",
+    r"\bapplications?\s+(?:are\s+|is\s+|been\s+)?closed\b",
+    r"\bthis position has been filled\b",
+    # "<the position|vacancy|job|role|posting> [is|was|has been] closed"
+    r"\b(?:position|vacancy|job|role|posting|listing)\s+"
+    r"(?:is\s+|was\s+|has\s+been\s+)?closed\b",
+    r"\bno longer open\b",
+    r"\bexpired\s+(?:job|vacancy|posting|listing)\b",
 )
 _ZOMBIE_CONTENT_SNIPPETS_AR: tuple[str, ...] = (
     "لم نعد نقبل استمارات",
@@ -454,8 +531,10 @@ _ZOMBIE_CONTENT_SNIPPETS_AR: tuple[str, ...] = (
 )
 _ZOMBIE_DECLARATION_RE = re.compile(
     "|".join(
-        re.escape(phrase)
-        for phrase in _ZOMBIE_CONTENT_SNIPPETS_EN + _ZOMBIE_CONTENT_SNIPPETS_AR
+        # EN entries are already anchored regex; AR entries are literals with no
+        # word-boundary concept in Arabic script, so they stay escaped.
+        _ZOMBIE_CONTENT_SNIPPETS_EN
+        + tuple(re.escape(p) for p in _ZOMBIE_CONTENT_SNIPPETS_AR)
     ),
     re.IGNORECASE,
 )
@@ -566,26 +645,14 @@ def _is_category_page(title: str, url: str) -> bool:
 # FIX B — Approved search board registry
 # ---------------------------------------------------------------------------
 
-APPROVED_SEARCH_BOARDS: dict[str, str] = {
-    "linkedin":       "site:linkedin.com/jobs",
-    "indeed":         "site:indeed.com",
-    "glassdoor":      "site:glassdoor.com",
-    "wuzzuf":         "site:wuzzuf.net",
-    "bayt":           "site:bayt.com",
-    "akhtaboot":      "site:akhtaboot.com",
-    "weworkremotely": "site:weworkremotely.com",
-    "remoteok":       "site:remoteok.com",
-    "himalayas":      "site:himalayas.app",
-    "wellfound":      "site:wellfound.com",
-    "dice":           "site:dice.com",
-    # Direct-ATS boards — the freshest source available: postings are served
-    # straight from the hiring company's applicant-tracking system and are
-    # taken down the moment a role is filled/closed, so zombie/expired
-    # listings are structurally rare here versus scraped aggregators.
-    "greenhouse":     "site:greenhouse.io",
-    "lever":          "site:jobs.lever.co",
-}
-
+# The registry itself now lives in backend/agents/prompts.py, alongside the
+# board grouping used to render it into both the tool description and the agent
+# system prompt. Keeping the data next to the text that describes it is what
+# stops a newly-added board from being filtered-for but never searched-for.
+#
+# Re-exported here so existing `from backend.agents.tools import
+# APPROVED_SEARCH_BOARDS` imports keep working.
+APPROVED_SEARCH_BOARDS = _APPROVED_SEARCH_BOARDS
 APPROVED_SITE_TOKENS: List[str] = list(APPROVED_SEARCH_BOARDS.values())
 
 
@@ -816,6 +883,18 @@ def _truncate_at_sidebar_boundary(text: str, raw_html: str = "") -> str:
 # "Similar Jobs" / sidebar / footer markup begins.
 _HEAD_PROBE_BYTES: int = 8_000
 
+# LinkedIn needs a much larger window. Its closure badge sits at roughly byte
+# 31,500-34,700 of the guest job page, far past the 8KB budget above — so the
+# probe fetched the page, found nothing, and reported the listing as fresh.
+# Measured across 8 live listings: closed ones carried the badge at ~31.5-31.8KB.
+# That gap is why two year-old "No longer accepting applications" postings were
+# returned to the user at a 90% match score.
+#
+# Reading further is safe here because the LinkedIn check is a positive
+# assertion on a structural CSS class (see _LINKEDIN_CLOSED_BADGE_RE), not
+# prose matching — so sidebar/footer bleed cannot trigger it.
+_LINKEDIN_HEAD_PROBE_BYTES: int = 65_536
+
 # Literal closure-badge patterns (positive assertion, not prose). These
 # match ONLY the specific, unambiguous UI strings each board renders for a
 # closed/expired listing — deliberately narrow so they cannot match inside
@@ -826,7 +905,19 @@ _WUZZUF_CLOSED_BADGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The FIRST alternative is the load-bearing one: LinkedIn renders a
+#     <figcaption class="closed-job__flavor--closed">
+# element only on closed listings. Verified across 8 live listings — present on
+# every closed one, absent on every open one, and inversely correlated with the
+# apply widget in all 8.
+#
+# Matching the class rather than the prose matters twice over: it cannot be
+# tripped by a job description that happens to discuss applications closing,
+# and it is locale-independent, so it works on Arabic-language pages served to
+# MENA users without needing a translation for each phrase. The localized
+# prose variants are kept as a fallback in case the markup changes.
 _LINKEDIN_CLOSED_BADGE_RE = re.compile(
+    r"closed-job__flavor--closed|"
     r"no longer accepting applications|"
     r"لم نعد نقبل استمارات|"
     r"تم إغلاق هذا الإعلان|"
@@ -931,7 +1022,13 @@ def _verify_live_url_is_stale(url: str, timeout: float = 6.0) -> bool:
         return False
 
     use_narrow_probe = _is_canonical_listing_url(url)
-    fetch_size = _HEAD_PROBE_BYTES if use_narrow_probe else 65_536
+    if not use_narrow_probe:
+        fetch_size = 65_536
+    elif "linkedin.com" in netloc:
+        # LinkedIn buries its closure badge ~31KB into the page; 8KB misses it.
+        fetch_size = _LINKEDIN_HEAD_PROBE_BYTES
+    else:
+        fetch_size = _HEAD_PROBE_BYTES
 
     try:
         req = urllib.request.Request(
@@ -979,6 +1076,18 @@ def _verify_live_url_is_stale(url: str, timeout: float = 6.0) -> bool:
 
     if use_narrow_probe:
         # --- Tier 1: narrow head-only badge + age check -------------------
+        #
+        # The two checks below deliberately run over DIFFERENT windows:
+        #
+        #   badge → the full fetched slice. It is a positive assertion on a
+        #           structural CSS class, so depth cannot make it wrong, and on
+        #           LinkedIn the badge only appears ~31KB in.
+        #   age   → the first _HEAD_PROBE_BYTES only. These are prose regexes
+        #           ("posted 2 years ago"), and past the hero section the page
+        #           carries "Similar jobs" / "People also viewed" entries whose
+        #           age strings belong to OTHER postings. Running them over the
+        #           widened slice would fail this listing for its neighbours'
+        #           staleness.
         if _has_explicit_closed_badge(raw_html, netloc):
             logger.info(
                 "Live probe [closed-badge] → %r (narrow head-probe, %d bytes)",
@@ -986,13 +1095,13 @@ def _verify_live_url_is_stale(url: str, timeout: float = 6.0) -> bool:
             )
             return True
 
-        head_text = re.sub(r"<[^>]+>", " ", raw_html)
+        head_text = re.sub(r"<[^>]+>", " ", raw_html[:_HEAD_PROBE_BYTES])
         head_text = html.unescape(head_text)
 
         if _snippet_is_stale(head_text, title=""):
             logger.info(
                 "Live probe [age-badge] → %r (narrow head-probe, %d bytes)",
-                url, len(raw_html),
+                url, _HEAD_PROBE_BYTES,
             )
             return True
 
@@ -1105,80 +1214,13 @@ def _join_results_within_budget(
 # Tool 1: Tavily Job Search
 # ---------------------------------------------------------------------------
 
-@tool
+# The LLM-facing description is generated in backend/agents/prompts.py from
+# the same constants the agent system prompt uses, so the two cannot drift.
+# It is passed explicitly rather than written as a docstring because a
+# docstring cannot interpolate those shared values.
+@tool(description=TAVILY_TOOL_DESCRIPTION)
 def tavily_job_search(query: str) -> str:
-    """
-    Search for REAL, CURRENTLY OPEN job postings on APPROVED premium job boards.
-
-    ══════════════════════════════════════════════════════════════════════
-    CRITICAL RULES — read completely before constructing each query call
-    ══════════════════════════════════════════════════════════════════════
-
-    RULE 1 — TECHNOLOGY STACK IS MANDATORY IN EVERY QUERY:
-      Every query MUST include at least one concrete technology keyword from
-      the candidate's stack (Python, React, Django, Node.js, Flutter, C#,
-      ASP.NET, etc.). A stack-free query is a CRITICAL FAILURE.
-
-    RULE 2 — APPROVED BOARDS ONLY — NO OPEN-WEB QUERIES:
-      Every query MUST include a site: clause from the approved list below.
-
-      APPROVED SITE TOKENS (use exactly as written — one per query):
-        Global generalist  : site:linkedin.com/jobs
-                             site:indeed.com
-                             site:glassdoor.com
-        MENA / Egypt / Gulf: site:wuzzuf.net
-                             site:bayt.com
-                             site:akhtaboot.com
-        Remote-focused     : site:weworkremotely.com
-                             site:remoteok.com
-                             site:himalayas.app
-        Tech-specialist    : site:wellfound.com
-                             site:dice.com
-        Direct ATS (freshest — prefer when possible):
-                             site:greenhouse.io
-                             site:jobs.lever.co
-
-      You MAY combine up to two approved boards using OR in one query.
-      You may NOT use any domain not on the list above.
-      You may NOT omit the site: clause entirely.
-
-    RULE 3 — QUERY FORMAT (mandatory structure — STACK TOKENS ONLY):
-      "<TECH_1> <TECH_2> <role> <modifier> <site:TOKEN>"
-      where modifier is one of: jobs, internship, intern, trainee
-
-      Required examples:
-        ✓ "Python Django Back-End Developer jobs site:wuzzuf.net OR site:bayt.com"
-        ✓ "React Node.js Software Engineer internship site:linkedin.com/jobs"
-        ✓ "C# ASP.NET Backend Developer jobs site:glassdoor.com OR site:wellfound.com"
-
-      Forbidden examples:
-        ✗ "Back-End Developer jobs Cairo"            ← no tech, no site:
-        ✗ "Python developer jobs"                    ← no site:
-        ✗ "Go ASP.NET Backend Developer jobs site:linkedin.com/jobs"
-              ← leaked operational "Go" corrupts a C#/.NET search.
-
-    RULE 4 — FIRE BOTH REQUIRED QUERIES IN PARALLEL, IN YOUR FIRST TURN.
-
-    RULE 5 — NEVER INVENT RESULTS. Copy URLs character-for-character.
-
-    RULE 6 — RECENCY: the tool automatically restricts results to the past
-      month (Tavily start_date + time_range) AND appends the current year plus
-      "hiring now" / "actively hiring" recency tokens to every query, so you
-      do not need to add a year yourself — but you MAY append "hiring now" or
-      the current year to a query and it will not be penalised. Never add a
-      year OLDER than the current one (that reintroduces the archived-listing
-      problem this filter exists to solve).
-
-    Returns a numbered list of job postings from approved boards only.
-    Category/listing pages, templates, blog articles, career-advice pages,
-    and non-vacancy subpaths are excluded BEFORE results reach you via a
-    multi-layer filter: (1) URL path gating against each board's canonical
-    listing structure, (2) snippet/title content scanning for age badges
-    (e.g. "Posted 5 years ago") and closed declarations, and (3) a live
-    shallow probe for boards where snippet staleness alone is insufficient.
-    Every listing shown below is a structurally-validated individual posting
-    candidate.
-    """
+    """Search approved job boards via Tavily. See prompts.TAVILY_TOOL_DESCRIPTION."""
     settings = get_settings()
 
     if not settings.tavily_api_key:
@@ -1230,11 +1272,18 @@ def tavily_job_search(query: str) -> str:
     # the search engine biases toward freshly-posted roles. The current year
     # plus "hiring now"/"actively hiring" pull active listings to the top and
     # push multi-year-old archived pages down/out, complementing the
-    # start_date + time_range crawl-date filters applied on the API call.
+    # time_range crawl-date filter applied on the API call.
+    #
+    # The negative terms -"jobs in" -"browse jobs" -"vacancies in" used to be
+    # appended here too. They were removed: the system prompt itself identifies
+    # the "jobs in" token collision as a primary cause of empty result sets
+    # (a legitimate listing page frequently contains that phrase in nav chrome),
+    # and _is_category_page() already rejects true aggregator pages
+    # deterministically AFTER retrieval — which is the right place for it, since
+    # it inspects the actual URL and title rather than suppressing the query.
     enriched_query = (
         f'{clean_query} '
-        f'("hiring now" OR "actively hiring" OR "apply now" OR "{current_year}") '
-        f'-"jobs in" -"browse jobs" -"vacancies in"'
+        f'("hiring now" OR "actively hiring" OR "apply now" OR "{current_year}")'
     )
 
     # NOTE: Tavily rejects start_date/end_date and time_range together
@@ -1248,29 +1297,29 @@ def tavily_job_search(query: str) -> str:
         settings.tavily_max_results, len(exclude_domains),
     )
 
-    try:
-        response = client.search(
-            query=enriched_query,
-            search_depth="advanced",
+    # Transient failures (429/5xx/timeouts) are retried with backoff before the
+    # basic-depth fallback engages, so a momentary blip no longer costs one of
+    # the agent's very limited iterations.
+    @tavily_retry
+    def _search(query: str, depth: str) -> dict:
+        return client.search(
+            query=query,
+            search_depth=depth,
             max_results=settings.tavily_max_results,
             time_range=time_range,
             exclude_domains=exclude_domains,
             include_answer=False,
             include_raw_content=False,
         )
+
+    try:
+        response = _search(enriched_query, "advanced")
     except Exception as exc:
-        logger.error("Tavily advanced search failed: %s", exc)
+        logger.error("Tavily advanced search failed after retries: %s", exc)
         try:
-            response = client.search(
-                query=clean_query,
-                search_depth="basic",
-                max_results=settings.tavily_max_results,
-                time_range=time_range,
-                exclude_domains=exclude_domains,
-                include_answer=False,
-                include_raw_content=False,
-            )
+            response = _search(clean_query, "basic")
         except Exception as exc2:
+            logger.error("Tavily basic search also failed after retries: %s", exc2)
             return f"Search error: {exc2}"
 
     results: List[dict] = response.get("results", [])
@@ -1382,12 +1431,28 @@ def tavily_job_search(query: str) -> str:
             dropped_path_gate, dropped_bad_url, dropped_stale, dropped_live_stale,
         )
 
+    # Accumulate into request-scoped stats so the API can explain an empty
+    # result set to the user in terms of what actually happened, instead of
+    # the generic "could not produce a structured response".
+    record_filter_stats(
+        examined=len(results),
+        kept=len(usable_results),
+        category=dropped_category,
+        closed=dropped_stale + dropped_live_stale,
+        path_gate=dropped_path_gate,
+        blocked=dropped_blacklist + dropped_pollution + dropped_bad_url,
+    )
+
     if not usable_results:
         drop_counts = {
             "path-gate (non-vacancy subpath)": dropped_path_gate,
             "category/listing page":           dropped_category,
             "stale/zombie listing":            dropped_stale,
             "bad URL":                         dropped_bad_url,
+            # Was omitted, so a run where every listing was verified CLOSED by
+            # the live probe reported some other reason as dominant — the most
+            # actionable signal available, misattributed.
+            "closed listing (verified live)":  dropped_live_stale,
         }
         dominant      = max(drop_counts, key=drop_counts.get)
         dominant_note = (
@@ -1408,9 +1473,15 @@ def tavily_job_search(query: str) -> str:
         "internship/trainee queries before finalizing.]\n"
     )
 
+    # Report the filter that was ACTUALLY applied. This used to claim
+    # "posted on/after <recency_cutoff>" — but recency_cutoff is never sent to
+    # Tavily (start_date and time_range are mutually exclusive), so the model was
+    # being told a date filter had been applied that had not been. time_range is
+    # also a CRAWL-date window, not a posting-date one; saying so keeps the model
+    # from treating it as a guarantee about when the job was posted.
     intro_block = (
         f"Results for: {clean_query!r} "
-        f"({len(usable_results)} listings, posted on/after {recency_cutoff})\n"
+        f"({len(usable_results)} listings; crawled within the past {time_range})\n"
     )
 
     header_blocks = [pipeline_reminder, tech_warning, board_warning, intro_block]

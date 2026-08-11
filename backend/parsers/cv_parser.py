@@ -30,7 +30,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final, List, Sequence
+from typing import Final, List, Optional, Sequence
 
 from backend.core.config import get_settings
 
@@ -55,6 +55,11 @@ class CandidateProfile:
     skills          Hard skills harvested verbatim from the text via deterministic
                      token matching (not LLM-inferred). Order follows the internal
                      skills dictionary, not order-of-appearance in the document.
+    years_experience Total years of professional experience, or None when it
+                     could not be determined with reasonable confidence.
+    seniority       One of intern/junior/mid/senior/lead/principal, or None when
+                     undetermined. None means "unknown" and must render as blank —
+                     never substitute a confident-looking default.
     parse_error     Non-empty if parsing produced a recoverable warning.
     """
 
@@ -63,6 +68,8 @@ class CandidateProfile:
     detected_title: str = ""
     word_count: int = 0
     skills: List[str] = field(default_factory=list)
+    years_experience: Optional[float] = None
+    seniority: Optional[str] = None
     parse_error: str = ""
 
     # Convenience helpers --------------------------------------------------
@@ -144,6 +151,133 @@ def _infer_title(text: str) -> str:
             ):
                 return line
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Experience extraction
+# ---------------------------------------------------------------------------
+#
+# Design rule for everything below: return None when confidence is low. The
+# previous implementation reported the hardcoded string "Professional" for every
+# candidate and the UI rendered it as a definitive "LEVEL:" badge. A blank field
+# the user can fill in is honest; a confident wrong label is not.
+#
+# Phase 3 makes these values user-editable; until then they are advisory only.
+
+# "5+ years of experience", "over 3 years' experience", "7 yrs experience"
+_EXPLICIT_YEARS_RE = re.compile(
+    r"\b(?:over|more\s+than|about|approx(?:imately)?\.?|~)?\s*"
+    r"(\d{1,2})\s*\+?\s*(?:years?|yrs?)\b[^.\n]{0,30}?\bexperien\w*",
+    re.IGNORECASE,
+)
+
+# Date ranges in an experience section: "Jan 2019 - Mar 2022", "2019 – present".
+_DATE_RANGE_RE = re.compile(
+    r"\b(?:(?P<sm>[A-Za-z]{3,9})\.?\s+)?(?P<sy>(?:19|20)\d{2})\s*"
+    r"(?:-|–|—|to|until)\s*"
+    r"(?:(?P<em>[A-Za-z]{3,9})\.?\s+)?(?P<ey>(?:19|20)\d{2}|present|current|now)\b",
+    re.IGNORECASE,
+)
+
+_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ["jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"],
+        start=1,
+    )
+}
+
+# Ordered most-senior first so the first hit wins.
+_SENIORITY_PATTERNS: Sequence[tuple[str, re.Pattern]] = (
+    ("principal", re.compile(r"\b(principal|staff|distinguished)\s+\w*\s*engineer\b|\bprincipal\b", re.IGNORECASE)),
+    ("lead",      re.compile(r"\b(lead|head\s+of|engineering\s+manager|team\s+lead|tech\s+lead)\b", re.IGNORECASE)),
+    ("senior",    re.compile(r"\bsenior\b|\bsr\.?\s", re.IGNORECASE)),
+    ("junior",    re.compile(r"\bjunior\b|\bjr\.?\s|\bentry[\s-]level\b|\bgraduate\s+(?:trainee|program)\b", re.IGNORECASE)),
+    ("intern",    re.compile(r"\bintern(ship)?\b|\btrainee\b", re.IGNORECASE)),
+)
+
+
+def _extract_years_experience(text: str, current_year: int | None = None) -> Optional[float]:
+    """
+    Best-effort total years of professional experience.
+
+    Two strategies, in order of reliability:
+      1. An explicit self-reported claim ("5+ years of experience").
+      2. The span from the earliest to the latest employment date range found.
+
+    Returns None when neither yields a plausible value. Values above 50 are
+    treated as a parse artefact rather than a career.
+    """
+    if not text.strip():
+        return None
+
+    explicit = [int(m.group(1)) for m in _EXPLICIT_YEARS_RE.finditer(text)]
+    plausible = [y for y in explicit if 0 < y <= 50]
+    if plausible:
+        return float(max(plausible))
+
+    if current_year is None:
+        from datetime import datetime, timezone
+        current_year = datetime.now(timezone.utc).year
+
+    starts: List[float] = []
+    ends: List[float] = []
+    for m in _DATE_RANGE_RE.finditer(text):
+        start_year = int(m.group("sy"))
+        start_month = _MONTHS.get((m.group("sm") or "")[:3].lower(), 1)
+
+        raw_end = (m.group("ey") or "").lower()
+        if raw_end in ("present", "current", "now"):
+            end_year, end_month = current_year, 12
+        else:
+            end_year = int(raw_end)
+            end_month = _MONTHS.get((m.group("em") or "")[:3].lower(), 12)
+
+        # Reject impossible or reversed ranges rather than producing a negative.
+        if not (1950 <= start_year <= current_year) or end_year < start_year:
+            continue
+        starts.append(start_year + (start_month - 1) / 12)
+        ends.append(end_year + (end_month - 1) / 12)
+
+    if not starts:
+        return None
+
+    span = max(ends) - min(starts)
+    if span <= 0 or span > 50:
+        return None
+    return round(span, 1)
+
+
+def _infer_seniority(text: str, years: Optional[float] = None) -> Optional[str]:
+    """
+    Best-effort seniority band.
+
+    Prefers an explicit title keyword near the top of the CV (where the current
+    role lives); falls back to banding by years of experience. Returns None when
+    neither signal is available.
+    """
+    if not text.strip():
+        return None
+
+    # Only the header region — a "senior" mentioned deep in a job description
+    # of a past role says nothing about the candidate's current level.
+    header = "\n".join(text.splitlines()[:12])
+    for label, pattern in _SENIORITY_PATTERNS:
+        if pattern.search(header):
+            return label
+
+    if years is None:
+        return None
+    if years < 1:
+        return "junior"
+    if years < 3:
+        return "junior"
+    if years < 6:
+        return "mid"
+    if years < 10:
+        return "senior"
+    return "lead"
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +653,12 @@ def parse_cv_bytes(file_bytes: bytes, file_name: str) -> CandidateProfile:
     settings = get_settings()
     suffix = Path(file_name).suffix.lower()
 
-    logger.info("Parsing CV file: '%s' (%d bytes)", file_name, len(file_bytes))
+    # PRIVACY: CV filenames routinely embed the candidate's real name
+    # ("Jane_Doe_CV.pdf"), so log the type and size at INFO and keep the name
+    # itself at DEBUG. Security-rejection paths in routes.py intentionally still
+    # log the filename — there the provenance is the point.
+    logger.info("Parsing CV file: type=%s (%d bytes)", suffix or "(none)", len(file_bytes))
+    logger.debug("CV filename: %r", file_name)
 
     parse_error = ""
     raw_text = ""
@@ -550,6 +689,8 @@ def parse_cv_bytes(file_bytes: bytes, file_name: str) -> CandidateProfile:
     word_count = len(raw_text.split())
     detected_title = _infer_title(raw_text)
     skills = _harvest_skills(raw_text)
+    years_experience = _extract_years_experience(raw_text)
+    seniority = _infer_seniority(raw_text, years_experience)
 
     profile = CandidateProfile(
         raw_text=raw_text,
@@ -557,6 +698,8 @@ def parse_cv_bytes(file_bytes: bytes, file_name: str) -> CandidateProfile:
         detected_title=detected_title,
         word_count=word_count,
         skills=skills,
+        years_experience=years_experience,
+        seniority=seniority,
         parse_error=parse_error,
     )
 
@@ -564,12 +707,20 @@ def parse_cv_bytes(file_bytes: bytes, file_name: str) -> CandidateProfile:
         profile.parse_error = "CV appears to be empty or contained no extractable text."
         logger.warning("Empty CV after parsing '%s'.", file_name)
     else:
+        # PRIVACY: never log CV-derived content (detected title, skill values,
+        # raw text) above DEBUG. The UI tells the user their CV is "processed
+        # locally, never stored" — writing their job title and skill list into
+        # stdout logs quietly breaks that promise. Counts only at INFO.
         logger.info(
-            "CV parsed successfully: %d words, title hint: '%s', %d skills detected: %s",
+            "CV parsed successfully: %d words, title hint %s, %d skills detected.",
             word_count,
-            detected_title or "(none detected)",
+            "present" if detected_title else "absent",
             len(skills),
-            ", ".join(skills) if skills else "(none)",
+        )
+        logger.debug(
+            "CV parse detail: title=%r skills=%s",
+            detected_title,
+            skills,
         )
 
     return profile

@@ -1,0 +1,55 @@
+{
+  "_meta": {
+    "origin": "synthetic",
+    "why": "Remote-board and direct-ATS shapes, plus the two hub-page forms the path gate exists to reject: a Greenhouse company board (/<company>, no job id) and an Indeed search-results page (/q-*-jobs.html). Both look like listings to a snippet reader and are not vacancies.",
+    "expectations": {
+      "https://weworkremotely.com/remote-jobs/backend/senior-python-engineer": "survive",
+      "https://himalayas.app/jobs/senior-backend-engineer-at-doist": "survive",
+      "https://boards.greenhouse.io/anthropic/jobs/4019283": "survive",
+      "https://boards.greenhouse.io/anthropic": "drop:path_gate",
+      "https://www.indeed.com/q-python-developer-remote-jobs.html": "drop:bad_url",
+      "https://himalayas.app/companies/doist": "drop:path_gate"
+    }
+  },
+  "response": {
+    "query": "Python Django Backend Engineer Remote jobs site:weworkremotely.com OR site:himalayas.app",
+    "results": [
+      {
+        "url": "https://weworkremotely.com/remote-jobs/backend/senior-python-engineer",
+        "title": "Senior Python Engineer at Buffer - We Work Remotely",
+        "content": "Buffer is hiring a Senior Python Engineer. Fully remote, worldwide. Django, PostgreSQL, AWS. $120,000 - $150,000 USD. Posted 4 days ago.",
+        "score": 0.93
+      },
+      {
+        "url": "https://himalayas.app/jobs/senior-backend-engineer-at-doist",
+        "title": "Senior Backend Engineer at Doist - Himalayas",
+        "content": "Doist is looking for a Senior Backend Engineer. Remote (worldwide). Python, Django, Celery. Salary not specified. Posted 1 week ago.",
+        "score": 0.9
+      },
+      {
+        "url": "https://boards.greenhouse.io/anthropic/jobs/4019283",
+        "title": "Backend Engineer, Platform - Anthropic",
+        "content": "Anthropic is hiring a Backend Engineer on the Platform team. Remote-friendly, US or UK. Python, distributed systems. Posted 2 days ago.",
+        "score": 0.89
+      },
+      {
+        "url": "https://boards.greenhouse.io/anthropic",
+        "title": "Anthropic - Open Positions",
+        "content": "Browse all open roles at Anthropic. Engineering, Research, Policy, Operations. We are actively hiring across teams.",
+        "score": 0.85
+      },
+      {
+        "url": "https://www.indeed.com/q-python-developer-remote-jobs.html",
+        "title": "Python Developer Remote Jobs, Employment | Indeed.com",
+        "content": "2,481 Python Developer Remote jobs available on Indeed.com. Apply to Software Engineer, Backend Developer and more!",
+        "score": 0.82
+      },
+      {
+        "url": "https://himalayas.app/companies/doist",
+        "title": "Doist - Company Profile and Remote Jobs | Himalayas",
+        "content": "Doist builds Todoist and Twist. View company profile, culture, benefits, and all open remote positions.",
+        "score": 0.79
+      }
+    ]
+  }
+}

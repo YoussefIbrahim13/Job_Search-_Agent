@@ -1,0 +1,41 @@
+{
+  "_meta": {
+    "origin": "synthetic",
+    "why": "Arabic-language snippets from MENA boards. The staleness scanner reads Arabic age badges ('منذ 4 سنوات') because those pages are re-crawled daily and so pass every crawl-date filter. A fresh Arabic listing must survive that same scanner — the failure mode to avoid is a filter that rejects Arabic text wholesale.",
+    "expectations": {
+      "https://www.bayt.com/ar/jobs/senior-backend-developer-cairo-5512334": "survive",
+      "https://www.akhtaboot.com/jobs/48219-python-developer-amman": "survive",
+      "https://www.bayt.com/ar/jobs/net-developer-riyadh-4410021": "drop:stale",
+      "https://www.bayt.com/ar/jobs/java-developer-dubai-3901552": "drop:stale"
+    }
+  },
+  "response": {
+    "query": "Python Django مطور Cairo jobs site:bayt.com OR site:akhtaboot.com",
+    "results": [
+      {
+        "url": "https://www.bayt.com/ar/jobs/senior-backend-developer-cairo-5512334",
+        "title": "مطور برمجيات أول (Backend) - القاهرة، مصر | بيت.كوم",
+        "content": "شركة رائدة تبحث عن مطور Backend أول للعمل في القاهرة. خبرة في Python و Django و PostgreSQL. الراتب غير محدد. منذ 5 أيام.",
+        "score": 0.9
+      },
+      {
+        "url": "https://www.akhtaboot.com/jobs/48219-python-developer-amman",
+        "title": "Python Developer - Amman, Jordan | Akhtaboot",
+        "content": "مطلوب مطور Python للعمل في عمان. Django, FastAPI, REST APIs. دوام كامل. منذ أسبوعين.",
+        "score": 0.87
+      },
+      {
+        "url": "https://www.bayt.com/ar/jobs/net-developer-riyadh-4410021",
+        "title": "مطور .NET - الرياض، السعودية | بيت.كوم",
+        "content": "مطلوب مطور .NET بخبرة في C# و ASP.NET. الرياض، المملكة العربية السعودية. منذ 4 سنوات.",
+        "score": 0.68
+      },
+      {
+        "url": "https://www.bayt.com/ar/jobs/java-developer-dubai-3901552",
+        "title": "مطور Java - دبي | بيت.كوم",
+        "content": "شركة في دبي تبحث عن مطور Java. الوظيفة مغلقة. تم شغل الوظيفة.",
+        "score": 0.64
+      }
+    ]
+  }
+}

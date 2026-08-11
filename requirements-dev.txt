@@ -1,0 +1,9 @@
+# Development and test dependencies.
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest
+pytest-cov
+pytest-asyncio
+respx          # HTTP mocking for provider adapters (Phase 2)

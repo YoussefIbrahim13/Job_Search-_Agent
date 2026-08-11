@@ -659,7 +659,10 @@ input[type="text"]::placeholder { color: var(--muted); }
 </main>
 
 <script>
-const API_BASE = 'http://localhost:8000/api';
+// Relative, so the page always calls the server that served it. An absolute
+// localhost:8000 broke whenever uvicorn ran on any other port and forced every
+// request through CORS for no reason.
+const API_BASE = '/api';
 let selectedFile = null;
 let _typeInterval = null;
 let _stepTimeout = null;
@@ -811,7 +814,17 @@ function renderResults(data) {
     const p = data.profile;
     profileSection.style.display = 'block';
     document.getElementById('r-name').textContent = p.detected_title || 'CANDIDATE';
-    document.getElementById('r-level').textContent = p.experience_level || '';
+    // experience_level is null when the CV gave no usable signal. Hide the
+    // whole element rather than rendering a bare "LEVEL: " prefix (the label
+    // comes from a CSS ::before, so an empty string still shows the prefix).
+    const levelEl = document.getElementById('r-level');
+    const level = p.experience_level || '';
+    const years = (p.years_experience !== null && p.years_experience !== undefined)
+      ? `${p.years_experience} yr${p.years_experience === 1 ? '' : 's'}`
+      : '';
+    const levelText = [level.toUpperCase(), years].filter(Boolean).join(' · ');
+    levelEl.textContent = levelText;
+    levelEl.style.display = levelText ? '' : 'none';
     const skillsEl = document.getElementById('r-skills');
     skillsEl.innerHTML = '';
     let pSkills = p.skills || [];

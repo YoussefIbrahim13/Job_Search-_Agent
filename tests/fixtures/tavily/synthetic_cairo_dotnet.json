@@ -1,0 +1,62 @@
+{
+  "_meta": {
+    "origin": "synthetic",
+    "why": "Cairo/.NET is the query shape that exposed the two worst false-negative bugs: the bare 'closed' substring killing every 'salary undisclosed' listing, and _FAKE_LINK_RE killing LinkedIn's pure-numeric canonical URL. Both are pinned here.",
+    "expectations": {
+      "https://wuzzuf.net/jobs/p/842119-Senior-NET-Developer-Cairo": "survive",
+      "https://www.linkedin.com/jobs/view/4396364201": "survive",
+      "https://wuzzuf.net/jobs/p/731044-Backend-Engineer-ASPNET-Giza": "survive",
+      "https://www.linkedin.com/jobs/view/net-application-developer-at-apexanalytix-4318820073": "survive",
+      "https://wuzzuf.net/jobs/p/551200-NET-Developer-Cairo-Legacy": "drop:stale",
+      "https://wuzzuf.net/jobs/egypt/software-development": "drop:category",
+      "https://www.reddit.com/r/csharp/comments/1abcdef/net_jobs_in_cairo": "drop:pollution"
+    }
+  },
+  "response": {
+    "query": "C# ASP.NET Backend Developer Cairo jobs site:wuzzuf.net OR site:linkedin.com/jobs",
+    "results": [
+      {
+        "url": "https://wuzzuf.net/jobs/p/842119-Senior-NET-Developer-Cairo",
+        "title": "Senior .NET Developer at Sylndr - Cairo, Egypt",
+        "content": "Sylndr is hiring a Senior .NET Developer in Cairo. 5+ years experience with C#, ASP.NET Core, SQL Server. Salary undisclosed. Full time - On-site. Posted 6 days ago.",
+        "score": 0.94
+      },
+      {
+        "url": "https://www.linkedin.com/jobs/view/4396364201",
+        "title": ".NET Full Stack Developer - Cairo, Egypt | LinkedIn",
+        "content": "Join our team as a .NET Full Stack Developer. C#, ASP.NET Core, Angular. Cairo, Egypt (Hybrid). Compensation not disclosed. Posted 2 weeks ago. Be among the first 25 applicants.",
+        "score": 0.91
+      },
+      {
+        "url": "https://wuzzuf.net/jobs/p/731044-Backend-Engineer-ASPNET-Giza",
+        "title": "Backend Engineer (ASP.NET) at Halan - Giza, Egypt",
+        "content": "Halan is looking for a Backend Engineer with strong ASP.NET Core and microservices experience. EGP 40,000 - 60,000 per month. Posted 3 days ago.",
+        "score": 0.88
+      },
+      {
+        "url": "https://www.linkedin.com/jobs/view/net-application-developer-at-apexanalytix-4318820073",
+        "title": ".NET Application Developer at apexanalytix | LinkedIn",
+        "content": "apexanalytix is hiring a .NET Application Developer. Remote - Egypt. C#, .NET 8, Azure. Salary not disclosed by employer. Posted 1 week ago.",
+        "score": 0.86
+      },
+      {
+        "url": "https://wuzzuf.net/jobs/p/551200-NET-Developer-Cairo-Legacy",
+        "title": ".NET Developer at LegacySoft - Cairo, Egypt",
+        "content": "LegacySoft seeks a .NET Developer. This position has been filled and applications are closed. Posted 2 years ago.",
+        "score": 0.71
+      },
+      {
+        "url": "https://wuzzuf.net/jobs/egypt/software-development",
+        "title": "Software Development Jobs in Egypt | Browse 1,240 Vacancies - WUZZUF",
+        "content": "Browse thousands of software development jobs in Egypt. Filter by experience level, salary, and company. New vacancies added daily.",
+        "score": 0.83
+      },
+      {
+        "url": "https://www.reddit.com/r/csharp/comments/1abcdef/net_jobs_in_cairo",
+        "title": "Any good .NET jobs in Cairo right now? : r/csharp",
+        "content": "I've been looking for .NET roles in Cairo for a few months. Anyone know which companies are actively hiring? Wuzzuf seems mostly stale.",
+        "score": 0.62
+      }
+    ]
+  }
+}
